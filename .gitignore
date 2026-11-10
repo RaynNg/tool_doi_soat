@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+build/
+dist/
+dist_moi/
+*.spec
+.taste-skill/
+
+# Du lieu noi bo do tool tu luu canh file chay
+danh_sach_bang.csv
+cau_hinh.json
+
+Screenshot*.png
