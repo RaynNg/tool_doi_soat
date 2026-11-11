@@ -11,8 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 
 from flask import Flask, Response, jsonify, request, send_from_directory
+import thrift_sasl
 from pyhive import hive
 from TCLIService.ttypes import TOperationState
+from thrift.transport import TSocket
+from thrift.transport.TTransport import TTransportException
 
 import reconcile
 
@@ -30,6 +33,8 @@ FIRST_PORT = 8765
 PORT_ATTEMPTS = 20
 POLL_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 5
+# Moi lenh Thrift (bat tay, mo session, poll trang thai) deu tra ve nhanh vi query chay async.
+RPC_TIMEOUT_SECONDS = 60
 MAX_PARALLEL = 16
 ERROR_TEXT_LIMIT = 2000
 
@@ -56,13 +61,27 @@ class QueryFailed(Exception):
 def connect(cfg):
     # PyHive khong co timeout ket noi, kiem tra truoc de bao loi nhanh khi sai host/port.
     socket.create_connection((cfg["host"], cfg["port"]), timeout=CONNECT_TIMEOUT_SECONDS).close()
-    return hive.connect(
-        host=cfg["host"],
-        port=cfg["port"],
-        username=cfg["username"],
-        password=cfg["password"],
-        auth="LDAP",
+    # Tu dung transport de dat timeout: server chay HTTP/SSL hoac khac kieu xac thuc se khong tra loi
+    # buoc bat tay SASL, khong co timeout thi PyHive treo vinh vien.
+    sock = TSocket.TSocket(cfg["host"], cfg["port"])
+    sock.setTimeout(RPC_TIMEOUT_SECONDS * 1000)
+    transport = thrift_sasl.TSaslClientTransport(
+        lambda: hive.get_installed_sasl(
+            host=cfg["host"], sasl_auth="PLAIN", username=cfg["username"], password=cfg["password"]
+        ),
+        "PLAIN",
+        sock,
     )
+    try:
+        return hive.connect(username=cfg["username"], thrift_transport=transport)
+    except TTransportException as exc:
+        if exc.type != TTransportException.TIMED_OUT:
+            raise
+        raise QueryFailed(
+            f"Đã mở được cổng nhưng server không phản hồi bước xác thực sau {RPC_TIMEOUT_SECONDS} giây. "
+            "Kiểm tra trong DBeaver xem URL JDBC có transportMode=http, ssl=true hay xác thực "
+            "khác LDAP (Kerberos/NOSASL) không."
+        ) from None
 
 
 def run_query(cfg, sql, cancel):
@@ -90,7 +109,7 @@ def error_text(exc):
 
 
 class Job:
-    def __init__(self, prepared, cfgs, threshold):
+    def __init__(self, prepared, cfgs, threshold, selected=None):
         self.id = uuid.uuid4().hex
         self.cfgs = cfgs
         self.threshold = threshold
@@ -99,7 +118,11 @@ class Job:
         self.state = "running"
         self.remaining = 0
         self.rows = []
-        for item in prepared:
+        for index, item in enumerate(prepared):
+            if selected is not None and index not in selected:
+                # Dong khong chon chay lai: giao dien giu ket qua cu cua dong nay.
+                self.rows.append({"state": "skipped", "error": "", "verdict": "", "metrics": [], "prepared": item, "sides": {}})
+                continue
             failed = bool(item["error"])
             self.rows.append(
                 {
@@ -157,11 +180,22 @@ class Job:
             except ValueError as exc:
                 row.update(state="error", error=str(exc))
 
+    def side_progress(self, side):
+        # Tien do rieng tung he thong de thay ben nao cham/treo/loi; dong loi cau hinh khong chay nen khong tinh.
+        runnable = [row for row in self.rows if row["state"] != "skipped" and not row["prepared"]["error"]]
+        outcomes = [row["sides"][side][0] for row in runnable if side in row["sides"]]
+        return {
+            "total": len(runnable),
+            "done": sum(o in ("ok", "error") for o in outcomes),
+            "error": outcomes.count("error"),
+        }
+
     def snapshot(self):
         with self.lock:
             return {
                 "id": self.id,
                 "state": self.state,
+                "progress": {side: self.side_progress(side) for side in SIDES},
                 "rows": [
                     {k: row[k] for k in ("state", "error", "verdict", "metrics")}
                     for row in self.rows
@@ -334,15 +368,25 @@ def run():
     if not data.get("rows"):
         raise ValueError("Danh sách bảng đang trống.")
 
+    selected = None
+    if data.get("indices") is not None:
+        try:
+            selected = {int(i) for i in data["indices"]}
+        except (TypeError, ValueError):
+            raise ValueError("Danh sách bảng cần chạy không hợp lệ.") from None
+        if not selected or not all(0 <= i < len(data["rows"]) for i in selected):
+            raise ValueError("Danh sách bảng cần chạy không hợp lệ.")
+
     date = str(data.get("date") or "")
     prepared = [reconcile.prepare_row(r, date) for r in data["rows"]]
-    job = Job(prepared, cfgs, threshold)
+    job = Job(prepared, cfgs, threshold, selected)
+    picked = [i for i in range(len(prepared)) if selected is None or i in selected]
 
     with jobs_lock:
         if any(j.state == "running" for j in jobs.values()):
             return jsonify(error="Đang có một lượt đối soát chạy."), 409
         try:
-            sql_path = write_sql_file(data["rows"], prepared, date)
+            sql_path = write_sql_file([data["rows"][i] for i in picked], [prepared[i] for i in picked], date)
         except OSError as exc:
             return jsonify(error=f"Chưa ghi được file câu query: {exc}"), 500
         jobs.clear()

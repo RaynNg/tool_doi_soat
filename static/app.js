@@ -21,6 +21,10 @@ let savedPath = "";
 let filter = "all";
 let runStarted = 0;
 let clockTimer = null;
+// Luot chay rieng vai bang: runSet la cac dong dang chay, kept la ket qua cu cua cac dong con lai.
+let runSet = null;
+let kept = [];
+let pendingRun = null;
 
 const esc = (value) =>
   String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -132,6 +136,15 @@ function clearResults() {
   $("clock").textContent = "";
 }
 
+// Sua/them/xoa mot dong chi bo ket qua cua dong do, de con chay lai rieng ma khong mat cac bang khac.
+function rowEdited(change) {
+  if (job) change(job.rows);
+  expanded = new Set();
+  save();
+  render();
+  schedulePreview();
+}
+
 function rowsChanged() {
   clearResults();
   save();
@@ -169,6 +182,7 @@ const ICONS = {
   alert: svgIcon(13, '<path d="M8 3v6M8 12.5v.1"/>'),
   edit: svgIcon(16, '<path d="M10.5 3.2 12.8 5.5 5.6 12.7l-3 .7.7-3zM9.2 4.5l2.3 2.3"/>'),
   trash: svgIcon(16, '<path d="M2.8 4.5h10.4M6.2 4.5V3h3.6v1.5M4.2 4.5l.6 8.5h6.4l.6-8.5M6.8 7v3.5M9.2 7v3.5"/>'),
+  play: svgIcon(16, '<path d="M5 3.3v9.4L12.4 8z"/>'),
 };
 
 const highlightSql = (sql) =>
@@ -210,7 +224,10 @@ function renderFinding(counts) {
     return;
   }
   if (isRunning()) {
-    setFinding(`Đang chạy, đã xong ${counts.done} / ${rows.length} bảng.`);
+    if (runSet) {
+      const left = [...runSet].filter((i) => statusOf(i) === "chay").length;
+      setFinding(`Đang chạy riêng ${runSet.size} bảng, còn ${left} bảng chưa xong.`);
+    } else setFinding(`Đang chạy, đã xong ${counts.done} / ${rows.length} bảng.`);
     return;
   }
   if (job.state === "cancelled") {
@@ -249,23 +266,18 @@ function renderBoard(counts) {
   });
 }
 
-function sumCounts(key) {
-  if (!job) return null;
-  let total = 0n;
-  let seen = false;
-  job.rows.forEach((r) => {
-    if (r.metrics.length && r.metrics[0][key] !== null) {
-      total += BigInt(r.metrics[0][key]);
-      seen = true;
-    }
-  });
-  return seen ? total.toString() : null;
+function renderSideProgress(side) {
+  const progress = job && job.progress ? job.progress[side] : null;
+  $(`total-${side}`).textContent = progress ? `${progress.done}/${progress.total}` : "—";
+  const errors = $(`errors-${side}`);
+  errors.hidden = !progress || !progress.error;
+  errors.textContent = progress ? `${progress.error} lỗi` : "";
 }
 
 function renderBridge(counts) {
   $("bridge").classList.toggle("running", isRunning());
-  $("total-old").textContent = groupDigits(sumCounts("old")) || "—";
-  $("total-new").textContent = groupDigits(sumCounts("new")) || "—";
+  renderSideProgress("old");
+  renderSideProgress("new");
   const share = job && counts.done ? (counts.ok / rows.length) * 100 : 0;
   $("ring-value").textContent = job && counts.done ? `${Math.floor(share)}%` : "—";
   $("ring-arc").setAttribute("stroke-dasharray", `${share} 100`);
@@ -394,7 +406,7 @@ function rowHtml(row, i) {
     <td class="num">${counts}</td>
     <td>${meters(metrics)}</td>
     <td>${pill(i)}</td>
-    <td><div class="row-actions"><button class="icon-btn" type="button" title="Sửa" aria-label="Sửa dòng ${i + 1}" data-edit="${i}"${locked}>${ICONS.edit}</button><button class="icon-btn danger" type="button" title="Xóa" aria-label="Xóa dòng ${i + 1}" data-remove="${i}"${locked}>${ICONS.trash}</button></div></td>
+    <td><div class="row-actions"><button class="icon-btn" type="button" title="Chạy riêng bảng này" aria-label="Chạy riêng dòng ${i + 1}" data-run="${i}"${locked || (config && config.error) ? " disabled" : ""}>${ICONS.play}</button><button class="icon-btn" type="button" title="Sửa" aria-label="Sửa dòng ${i + 1}" data-edit="${i}"${locked}>${ICONS.edit}</button><button class="icon-btn danger" type="button" title="Xóa" aria-label="Xóa dòng ${i + 1}" data-remove="${i}"${locked}>${ICONS.trash}</button></div></td>
   </tr>${open ? detailHtml(i, result, config) : ""}`;
 }
 
@@ -444,6 +456,7 @@ async function poll(id) {
     setFinding(`Mất kết nối với công cụ: ${err.message}`, "bad");
     return;
   }
+  next.rows = next.rows.map((r, i) => (r.state === "skipped" ? kept[i] || null : r));
   const changed = JSON.stringify(next) !== JSON.stringify(job);
   job = next;
   if (changed) render();
@@ -451,7 +464,8 @@ async function poll(id) {
   else clearInterval(clockTimer);
 }
 
-async function runAll() {
+// indices = null: chay tat ca; mang chi so: chay rieng cac dong do, giu ket qua cac dong khac.
+async function runAll(indices = null) {
   for (const [side, name] of Object.entries(SIDES)) {
     if (!$(`${side}_host`).value.trim() || !$(`${side}_username`).value.trim()) {
       location.hash = "ket-noi";
@@ -469,22 +483,29 @@ async function runAll() {
       $(`pw-${side}`).value = "";
       $(`pw-${side}-label`).hidden = !missing.includes(side);
     });
+    pendingRun = indices;
     $("pw-dialog").showModal();
     $(`pw-${missing[0]}`).focus();
     return;
   }
-  expanded = new Set();
-  filter = "all";
+  if (!indices) {
+    expanded = new Set();
+    filter = "all";
+  }
   $("run").disabled = true;
   try {
     const body = await postJson("/api/run", {
       connections: { old: connection("old"), new: connection("new") },
       rows,
+      indices,
       date: $("date").value,
       threshold: $("threshold").value,
       parallel: $("parallel").value,
     });
-    job = { id: body.id, state: "running", rows: rows.map(() => ({ state: "pending", error: "", verdict: "", metrics: [] })) };
+    runSet = indices ? new Set(indices) : null;
+    kept = runSet && job ? job.rows.slice() : [];
+    const pending = { state: "pending", error: "", verdict: "", metrics: [] };
+    job = { id: body.id, state: "running", rows: rows.map((_, i) => (runSet && !runSet.has(i) ? kept[i] || null : { ...pending })) };
     setSaved(`Đã ghi câu query vào ${body.sql_file}`);
     runStarted = Date.now();
     tickClock();
@@ -561,7 +582,9 @@ function exportResults() {
   const lines = [header];
   job.rows.forEach((r, i) => {
     const base = [rows[i].old_table, rows[i].new_table, rows[i].old_partition, rows[i].new_partition];
-    if (r.metrics.length) {
+    if (!r) {
+      lines.push([...base, "", "", "", "", "", "", "Chưa chạy", ""]);
+    } else if (r.metrics.length) {
       r.metrics.forEach((m) => lines.push([...base, m.label, m.old, m.new, m.diff, m.pct, m.ok ? "Đạt" : "Không đạt", VERDICT_TEXT[r.verdict], ""]));
     } else {
       lines.push([...base, "", "", "", "", "", "", r.state === "cancelled" ? "Đã dừng" : "Lỗi", r.error]);
@@ -653,10 +676,11 @@ $("editor-form").addEventListener("submit", async (event) => {
   const row = draft();
   const item = await refreshEditor();
   if (!item || item.error) return;
-  if (editingIndex === null) rows.push(row);
-  else rows[editingIndex] = row;
+  const index = editingIndex;
+  if (index === null) rows.push(row);
+  else rows[index] = row;
   $("editor").close();
-  rowsChanged();
+  rowEdited((results) => (index === null ? results.push(null) : (results[index] = null)));
 });
 
 $("editor-cancel").addEventListener("click", () => $("editor").close());
@@ -678,7 +702,7 @@ $("pw-form").addEventListener("submit", (event) => {
   });
   $("pw-dialog").close();
   save();
-  runAll();
+  runAll(pendingRun);
 });
 
 $("pw-cancel").addEventListener("click", () => $("pw-dialog").close());
@@ -694,12 +718,17 @@ $("rows").addEventListener("click", (event) => {
     if (expanded.has(i)) expanded.delete(i);
     else expanded.add(i);
     render();
+  } else if (button.dataset.run !== undefined) {
+    const i = Number(button.dataset.run);
+    expanded.add(i);
+    runAll([i]);
   } else if (button.dataset.edit !== undefined) {
     openEditor(Number(button.dataset.edit));
   } else if (button.dataset.remove !== undefined) {
-    rows.splice(Number(button.dataset.remove), 1);
+    const i = Number(button.dataset.remove);
+    rows.splice(i, 1);
     prepared = [];
-    rowsChanged();
+    rowEdited((results) => results.splice(i, 1));
   }
 });
 
@@ -723,7 +752,7 @@ document.querySelector(".tabs").addEventListener("click", (event) => {
 
 $("search").addEventListener("input", render);
 
-$("run").addEventListener("click", runAll);
+$("run").addEventListener("click", () => runAll());
 $("stop").addEventListener("click", stopRun);
 Object.keys(SIDES).forEach((side) => {
   $(`${side}_test`).addEventListener("click", () => testConnection(side));

@@ -82,6 +82,8 @@ h1 { font-size: 26px; line-height: 34px; font-weight: 700; letter-spacing: -.015
 .node { display: grid; gap: 2px; min-width: 128px; padding: 14px 16px; background: #fff; border: 0; box-shadow: 0 6px 18px rgba(91, 83, 67, .16); border-radius: var(--radius-card); }
 .node span, .node small { font-size: 12px; line-height: 16px; color: var(--muted); }
 .node strong { color: var(--navy); }
+.node-err { font-weight: 600; color: var(--brand-dark); }
+.node-err::before { content: "· "; color: var(--muted); font-weight: 400; }
 .node strong { font-size: 20px; line-height: 28px; font-weight: 600; letter-spacing: -.01em; }
 .bridge-line { flex: none; width: 34px; height: 8px; overflow: visible; }
 .bridge-line line { stroke: #a4947a; stroke-width: 2; stroke-dasharray: 2 7; stroke-linecap: round; vector-effect: non-scaling-stroke; }
@@ -182,13 +184,13 @@ th.num { font-family: var(--font); }
 #table tr.row.open > td:first-child { border-bottom-left-radius: 0; }
 #table tr.row.open > td:last-child { border-bottom-right-radius: 0; }
 .col-open { width: 48px; }
-.col-act { width: 92px; }
+.col-act { width: 132px; }
 .toggle { width: 28px; height: 28px; padding: 0; color: var(--muted); background: var(--raised); border: 0; border-radius: 8px; cursor: pointer; transition: background .14s, color .14s; }
 .toggle:hover { color: var(--text); background: #e6e8ec; }
 .toggle svg { display: block; margin: auto; transition: transform .16s; }
 .toggle[aria-expanded=true] svg { transform: rotate(90deg); }
-.tables div, .parts div { display: flex; align-items: baseline; max-width: 340px; overflow: hidden; white-space: nowrap; line-height: 22px; }
-.side { flex: none; width: 34px; font-size: 12px; color: var(--muted); }
+.tables div, .parts div { display: flex; align-items: baseline; max-width: 380px; overflow: hidden; white-space: nowrap; line-height: 22px; }
+.side { flex: none; width: 72px; font-size: 12px; color: var(--muted); }
 .tables .ns { color: var(--muted); }
 .tables b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .parts div { font-size: 13px; color: #4a4e58; }
