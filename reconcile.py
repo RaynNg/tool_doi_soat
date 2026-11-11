@@ -260,7 +260,8 @@ def _build_sql(table, partition, columns, date, side, now=None):
     table = _fill_date(table.strip(), date, f"Bảng {side}", now)
     if not table:
         raise ValueError(f"Chưa nhập bảng {side}.")
-    if not TABLE_RE.match(table):
+    # Cau mau (date=None) giu nguyen bien ngay trong ten bang, nen bo qua bien khi kiem tra.
+    if not TABLE_RE.match(DATE_TOKEN_RE.sub("x", VARIABLE_RE.sub("x", table))):
         raise ValueError(f"Tên bảng {side} không hợp lệ: {table}")
 
     where = WHERE_PREFIX_RE.sub("", partition.strip())

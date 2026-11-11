@@ -112,8 +112,12 @@ def error_text(exc):
 
 
 class Job:
-    def __init__(self, prepared, cfgs, threshold, selected=None):
+    def __init__(self, prepared, cfgs, threshold, selected=None, raw_rows=None, date=""):
         self.id = uuid.uuid4().hex
+        # Bien thoi gian tinh lai ngay truoc khi chay tung bang (N theo gio thuc te luc chay).
+        self.raw_rows = raw_rows
+        self.date = date
+        self.sql_path = None
         self.cfgs = cfgs
         self.threshold = threshold
         self.cancel = threading.Event()
@@ -149,8 +153,17 @@ class Job:
             return
         with self.lock:
             row["state"] = "running"
+            # Hai phia cua mot bang dung chung mot thoi diem de bien gio/phut giong nhau.
+            now = row.setdefault("now", datetime.now())
         try:
-            values = run_query(self.cfgs[side], row["prepared"][f"{side}_sql"], self.cancel)
+            sql = row["prepared"][f"{side}_sql"]
+            if self.raw_rows is not None:
+                fresh = reconcile.prepare_row(self.raw_rows[index], self.date, now)
+                if fresh["error"]:
+                    raise ValueError(fresh["error"])
+                sql = fresh[f"{side}_sql"]
+                row["prepared"][f"{side}_sql"] = sql
+            values = run_query(self.cfgs[side], sql, self.cancel)
             outcome = ("ok", values)
         except QueryCancelled:
             outcome = ("cancelled", None)
@@ -165,8 +178,15 @@ class Job:
             if len(row["sides"]) == 2:
                 self.settle(row)
             self.remaining -= 1
-            if not self.remaining:
+            finished = not self.remaining
+            if finished:
                 self.state = "cancelled" if self.cancel.is_set() else "done"
+        if finished and self.sql_path:
+            # Ghi lai file cau query theo dung gia tri bien da chay.
+            try:
+                write_sql_file([r["prepared"] for r in self.rows if r["state"] != "skipped"], self.date)
+            except OSError:
+                pass
 
     def settle(self, row):
         errors = [f"{SIDES[s]}: {o[1]}" for s, o in row["sides"].items() if o[0] == "error"]
@@ -234,7 +254,7 @@ def write_if_changed(path, content):
     os.replace(temp, path)
 
 
-def write_sql_file(rows, prepared, date):
+def write_sql_file(prepared, date):
     """Ghi bang va cau query cua lan chay canh file exe: phan tren Datalake, phan duoi Lakehouse."""
     stamp = re.sub(r"[^0-9-]", "", date) or "khong_ngay"
     path = os.path.join(DATA_DIR, f"sql_doi_soat_{stamp}.txt")
@@ -381,16 +401,17 @@ def run():
     date = str(data.get("date") or "")
     now = datetime.now()
     prepared = [reconcile.prepare_row(r, date, now) for r in data["rows"]]
-    job = Job(prepared, cfgs, threshold, selected)
+    job = Job(prepared, cfgs, threshold, selected, data["rows"], date)
     picked = [i for i in range(len(prepared)) if selected is None or i in selected]
 
     with jobs_lock:
         if any(j.state == "running" for j in jobs.values()):
             return jsonify(error="Đang có một lượt đối soát chạy."), 409
         try:
-            sql_path = write_sql_file([data["rows"][i] for i in picked], [prepared[i] for i in picked], date)
+            sql_path = write_sql_file([prepared[i] for i in picked], date)
         except OSError as exc:
             return jsonify(error=f"Chưa ghi được file câu query: {exc}"), 500
+        job.sql_path = sql_path
         jobs.clear()
         jobs[job.id] = job
 
