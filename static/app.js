@@ -294,7 +294,7 @@ function pill(i) {
 
 function pctText(metric) {
   if (!metric) return '<span class="dash">—</span>';
-  return metric.pct === null ? "Cũ = 0" : `${esc(metric.pct)}%`;
+  return metric.pct === null ? "Datalake = 0" : `${esc(metric.pct)}%`;
 }
 
 function worstSum(metrics) {
@@ -306,7 +306,7 @@ function worstSum(metrics) {
 }
 
 function shortPct(metric) {
-  if (metric.pct === null) return "Cũ = 0";
+  if (metric.pct === null) return "Datalake = 0";
   const value = Number(metric.pct);
   return value > 0 && value < 0.01 ? "<0.01%" : `${value.toFixed(2)}%`;
 }
@@ -335,7 +335,7 @@ function tableLabel(text) {
 function sideLines(oldText, newText, emptyText, format) {
   const line = (label, text) =>
     `<div title="${esc(text || emptyText)}"><span class="side">${label}</span>${text ? format(text) : `<span class="none">${emptyText}</span>`}</div>`;
-  return line("Cũ", oldText) + line("Mới", newText);
+  return line("Datalake", oldText) + line("Lakehouse", newText);
 }
 
 const partitionLabel = (text) => `<span class="val">${esc(text)}</span>`;
@@ -346,7 +346,7 @@ function detailHtml(i, result, config) {
   const metrics = result && result.metrics.length ? result.metrics : null;
   const errorText = (result && result.error) || (config && config.error) || "";
   const table = metrics
-    ? `<table class="metrics"><thead><tr><th>Chỉ số</th><th class="num">Cũ</th><th class="num">Mới</th><th class="num">Mới − cũ</th><th class="num">Lệch</th></tr></thead><tbody>${metrics
+    ? `<table class="metrics"><thead><tr><th>Chỉ số</th><th class="num">Datalake</th><th class="num">Lakehouse</th><th class="num">Lakehouse − Datalake</th><th class="num">Lệch</th></tr></thead><tbody>${metrics
         .map(
           (m) =>
             `<tr><td class="label">${esc(m.label)}</td><td class="num">${numCell(m.old)}</td><td class="num">${numCell(m.new)}</td><td class="num">${signedCell(m.diff)}</td><td class="num${m.ok ? "" : " over"}">${pctText(m)}</td></tr>`
@@ -357,7 +357,7 @@ function detailHtml(i, result, config) {
     ? `<div class="sql-stack">${["old", "new"]
         .map(
           (side) =>
-            `<div class="sql-block"><h3>Query hệ thống ${side === "old" ? "cũ" : "mới"}</h3><pre>${highlightSql(config[`${side}_sql`])}</pre><button class="copy" type="button" data-copy="${side}" data-index="${i}">Chép</button></div>`
+            `<div class="sql-block"><h3>Query ${side === "old" ? "Datalake" : "Lakehouse"}</h3><pre>${highlightSql(config[`${side}_sql`])}</pre><button class="copy" type="button" data-copy="${side}" data-index="${i}">Chép</button></div>`
         )
         .join("")}</div>`
     : "";
@@ -530,7 +530,7 @@ function csvCell(value) {
 const VERDICT_TEXT = { ok: "Khớp", lech: "Lệch", trong: "0 dòng" };
 
 function exportResults() {
-  const header = ["bang_cu", "bang_moi", "partition_cu", "partition_moi", "chi_so", "gia_tri_cu", "gia_tri_moi", "chenh_lech", "phan_tram_lech", "dat_nguong", "ket_qua_bang", "loi"];
+  const header = ["bang_datalake", "bang_lakehouse", "partition_datalake", "partition_lakehouse", "chi_so", "gia_tri_datalake", "gia_tri_lakehouse", "chenh_lech", "phan_tram_lech", "dat_nguong", "ket_qua_bang", "loi"];
   const lines = [header];
   job.rows.forEach((r, i) => {
     const base = [rows[i].old_table, rows[i].new_table, rows[i].old_partition, rows[i].new_partition];

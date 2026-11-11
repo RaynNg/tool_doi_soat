@@ -139,7 +139,7 @@ class Job:
                 self.state = "cancelled" if self.cancel.is_set() else "done"
 
     def settle(self, row):
-        names = {"old": "Hệ thống cũ", "new": "Hệ thống mới"}
+        names = {"old": "Datalake", "new": "Lakehouse"}
         errors = [f"{names[s]}: {o[1]}" for s, o in row["sides"].items() if o[0] == "error"]
         if errors:
             row.update(state="error", error="\n".join(errors))

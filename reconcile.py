@@ -1,4 +1,4 @@
-"""Doc CSV, sinh cau SQL va so sanh ket qua giua he thong cu va moi."""
+"""Doc CSV, sinh cau SQL va so sanh ket qua giua Datalake va Lakehouse."""
 import csv
 import io
 import re
@@ -80,13 +80,13 @@ def prepare_row(row, date=""):
         new_cols = _split_columns(row.get("new_sum_columns", "")) or old_cols
         if len(old_cols) != len(new_cols):
             raise ValueError(
-                f"Số cột tiền không khớp: hệ thống cũ {len(old_cols)} cột, hệ thống mới {len(new_cols)} cột."
+                f"Số cột tiền không khớp: Datalake {len(old_cols)} cột, Lakehouse {len(new_cols)} cột."
             )
         for col in old_cols + new_cols:
             _check_fragment(col, "Cột tiền")
 
-        old_sql = _build_sql(row.get("old_table", ""), row.get("old_partition", ""), old_cols, date, "cũ")
-        new_sql = _build_sql(row.get("new_table", ""), row.get("new_partition", ""), new_cols, date, "mới")
+        old_sql = _build_sql(row.get("old_table", ""), row.get("old_partition", ""), old_cols, date, "Datalake")
+        new_sql = _build_sql(row.get("new_table", ""), row.get("new_partition", ""), new_cols, date, "Lakehouse")
     except ValueError as exc:
         return {"error": str(exc), "old_sql": "", "new_sql": "", "metrics": []}
 
@@ -126,18 +126,18 @@ def _fill_date(text, date, name):
 
 
 def _build_sql(table, partition, columns, date, side):
-    table = _fill_date(table.strip(), date, f"Bảng hệ thống {side}")
+    table = _fill_date(table.strip(), date, f"Bảng {side}")
     if not table:
-        raise ValueError(f"Chưa nhập bảng hệ thống {side}.")
+        raise ValueError(f"Chưa nhập bảng {side}.")
     if not TABLE_RE.match(table):
-        raise ValueError(f"Tên bảng hệ thống {side} không hợp lệ: {table}")
+        raise ValueError(f"Tên bảng {side} không hợp lệ: {table}")
 
     where = WHERE_PREFIX_RE.sub("", partition.strip())
-    where = _fill_date(where, date, f"Partition hệ thống {side}")
-    _check_fragment(where, f"Partition hệ thống {side}")
+    where = _fill_date(where, date, f"Partition {side}")
+    _check_fragment(where, f"Partition {side}")
     leftover = LEFTOVER_TOKEN_RE.search(where)
     if leftover:
-        raise ValueError(f"Partition hệ thống {side} có biến ngày không hỗ trợ: {leftover.group()}")
+        raise ValueError(f"Partition {side} có biến ngày không hỗ trợ: {leftover.group()}")
 
     selects = ["COUNT(*) AS cnt"]
     selects += [f"SUM({col}) AS sum_{i}" for i, col in enumerate(columns, 1)]
@@ -161,7 +161,7 @@ def to_decimal(value):
 
 
 def compare(metrics, old_values, new_values, threshold):
-    """So sanh tung chi so, lay he thong cu lam moc tinh phan tram.
+    """So sanh tung chi so, lay Datalake lam moc tinh phan tram.
 
     NULL (bang rong hoac toan NULL) duoc tinh la 0.
     """

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Đối soát cũ – mới</title>
+<title>Đối soát Datalake – Lakehouse</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Crect width='20' height='20' rx='5' fill='%23ef0032'/%3E%3Cpath d='M5 7.5h10M5 12.5h10' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/fonts.css">
 <link rel="stylesheet" href="/static/app.css">
@@ -49,7 +49,7 @@
           <path d="M0 340C220 292 420 372 660 326S900 300 1000 322V400H0Z" fill="#e7dac3"/>
         </svg>
         <div class="hero-main">
-          <h1>Đối soát hệ thống cũ và mới</h1>
+          <h1>Đối soát Datalake và Lakehouse</h1>
           <p id="finding" class="finding" role="status"></p>
           <div class="run-controls">
             <label>Ngày đối soát
@@ -67,7 +67,7 @@
         </div>
         <div id="bridge" class="bridge" aria-label="Tổng quan đối chiếu">
           <div class="node">
-            <span>Hệ thống cũ</span>
+            <span>Datalake</span>
             <strong id="total-old" class="num">—</strong>
             <small>dòng đã đọc</small>
           </div>
@@ -81,7 +81,7 @@
           </div>
           <svg class="bridge-line" viewBox="0 0 64 8" preserveAspectRatio="none" aria-hidden="true"><line x1="0" y1="4" x2="64" y2="4"/></svg>
           <div class="node">
-            <span>Hệ thống mới</span>
+            <span>Lakehouse</span>
             <strong id="total-new" class="num">—</strong>
             <small>dòng đã đọc</small>
           </div>
@@ -144,7 +144,7 @@
     <main id="view-conn" hidden>
       <section class="page-title">
         <h1>Kết nối Thrift</h1>
-        <p class="muted">Một Thrift Server đọc được cả hệ thống cũ và mới.</p>
+        <p class="muted">Một Thrift Server đọc được cả Datalake và Lakehouse.</p>
       </section>
       <div class="conn-grid">
         <section class="card conn" aria-label="Thông tin kết nối">
@@ -182,18 +182,18 @@
   <form id="editor-form" method="dialog">
     <h2 id="editor-title">Thêm bảng</h2>
     <div class="pair">
-      <label>Bảng hệ thống cũ<input name="old_table" spellcheck="false" placeholder="old_db.giao_dich"></label>
-      <label>Bảng hệ thống mới<input name="new_table" spellcheck="false" placeholder="new_db.giao_dich"></label>
-      <label>Partition cũ (để trống nếu không có)<input name="old_partition" spellcheck="false" placeholder="mon={yymm} AND pay_type=2"></label>
-      <label>Partition mới (để trống nếu không có)<input name="new_partition" spellcheck="false" placeholder="`partition`={yyyymmdd}"></label>
-      <label>Cột tiền cũ, cách nhau bằng |<input name="old_sum_columns" spellcheck="false" placeholder="so_tien|phi"></label>
-      <label>Cột tiền mới (để trống nếu trùng tên)<input name="new_sum_columns" spellcheck="false" placeholder="amount|fee"></label>
+      <label>Bảng Datalake<input name="old_table" spellcheck="false" placeholder="old_db.giao_dich"></label>
+      <label>Bảng Lakehouse<input name="new_table" spellcheck="false" placeholder="new_db.giao_dich"></label>
+      <label>Partition Datalake (để trống nếu không có)<input name="old_partition" spellcheck="false" placeholder="mon={yymm} AND pay_type=2"></label>
+      <label>Partition Lakehouse (để trống nếu không có)<input name="new_partition" spellcheck="false" placeholder="`partition`={yyyymmdd}"></label>
+      <label>Cột tiền Datalake, cách nhau bằng |<input name="old_sum_columns" spellcheck="false" placeholder="so_tien|phi"></label>
+      <label>Cột tiền Lakehouse (để trống nếu trùng tên)<input name="new_sum_columns" spellcheck="false" placeholder="amount|fee"></label>
     </div>
     <p class="hint">Partition là điều kiện WHERE, nhiều điều kiện nối bằng AND, giá trị chuỗi phải có dấu nháy. Biến ngày lấy theo ô Ngày đối soát, ví dụ với ngày 2026-11-09: {yymm} là 2611, {yyyymm} là 202611, {yyyymmdd} là 20261109, {date} là 2026-11-09. Ghép tự do từ yyyy, yy, mm, dd.</p>
     <p id="editor-error" class="error-text" role="alert"></p>
     <div class="sql-pair">
-      <div><h3>Query hệ thống cũ</h3><pre id="editor-old-sql"></pre></div>
-      <div><h3>Query hệ thống mới</h3><pre id="editor-new-sql"></pre></div>
+      <div><h3>Query Datalake</h3><pre id="editor-old-sql"></pre></div>
+      <div><h3>Query Lakehouse</h3><pre id="editor-new-sql"></pre></div>
     </div>
     <div class="editor-actions">
       <button id="editor-cancel" class="btn" type="button">Hủy</button>
