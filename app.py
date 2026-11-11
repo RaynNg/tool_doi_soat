@@ -238,20 +238,13 @@ def write_sql_file(rows, prepared, date):
     """Ghi bang va cau query cua lan chay canh file exe: phan tren Datalake, phan duoi Lakehouse."""
     stamp = re.sub(r"[^0-9-]", "", date) or "khong_ngay"
     path = os.path.join(DATA_DIR, f"sql_doi_soat_{stamp}.txt")
-    lines = [f"-- Câu query đối soát ngày {date or '(chưa chọn ngày)'}", ""]
+    # Chi gom cau query de chep chay lai; dong sai cau hinh khong chay nen bo qua.
+    rule = "=" * 60
+    sections = []
     for side, name in SIDES.items():
-        tables = [str(r.get(f"{side}_table") or "") for r in rows]
-        lines += ["=" * 60, f"-- {name.upper()}", "=" * 60, "", f"-- Bảng ({len(tables)}):"]
-        lines += [f"--   {i}. {t}" for i, t in enumerate(tables, 1)]
-        lines += ["", "-- Query:", ""]
-        for i, (table, item) in enumerate(zip(tables, prepared), 1):
-            lines.append(f"-- [{i}] {table}")
-            if item["error"]:
-                lines.append(f"-- LỖI CẤU HÌNH, không chạy: {item['error']}")
-            else:
-                lines.append(item[f"{side}_sql"] + ";")
-            lines.append("")
-    content = "\r\n".join(lines).encode("utf-8")
+        queries = [f"{item[f'{side}_sql']};" for item in prepared if not item["error"]]
+        sections.append("\n\n".join([f"{rule}\n-- {name.upper()}\n{rule}", *queries]))
+    content = ("\n\n".join(sections) + "\n").replace("\n", "\r\n").encode("utf-8")
     temp = path + ".tmp"
     with open(temp, "wb") as fh:
         fh.write(content)
