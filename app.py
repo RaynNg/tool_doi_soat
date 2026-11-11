@@ -1,6 +1,7 @@
 """Web local doi soat du lieu qua Spark Thrift Server."""
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -21,7 +22,10 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 ROWS_FILE = "danh_sach_bang.csv"
 SETTINGS_FILE = "cau_hinh.json"
-SETTING_KEYS = ("host", "port", "username", "parallel", "threshold")
+SIDES = {"old": "Datalake", "new": "Lakehouse"}
+# Mat khau luu thang trong cau_hinh.json: VDI rieng tu, nguoi dung khong muon nhap lai moi lan mo tool.
+CONN_KEYS = ("host", "port", "username", "password")
+SETTING_KEYS = tuple(f"{side}_{key}" for side in SIDES for key in CONN_KEYS) + ("parallel", "threshold")
 FIRST_PORT = 8765
 PORT_ATTEMPTS = 20
 POLL_SECONDS = 1.0
@@ -86,9 +90,9 @@ def error_text(exc):
 
 
 class Job:
-    def __init__(self, prepared, cfg, threshold):
+    def __init__(self, prepared, cfgs, threshold):
         self.id = uuid.uuid4().hex
-        self.cfg = cfg
+        self.cfgs = cfgs
         self.threshold = threshold
         self.cancel = threading.Event()
         self.lock = threading.Lock()
@@ -120,7 +124,7 @@ class Job:
         with self.lock:
             row["state"] = "running"
         try:
-            values = run_query(self.cfg, row["prepared"][f"{side}_sql"], self.cancel)
+            values = run_query(self.cfgs[side], row["prepared"][f"{side}_sql"], self.cancel)
             outcome = ("ok", values)
         except QueryCancelled:
             outcome = ("cancelled", None)
@@ -139,8 +143,7 @@ class Job:
                 self.state = "cancelled" if self.cancel.is_set() else "done"
 
     def settle(self, row):
-        names = {"old": "Datalake", "new": "Lakehouse"}
-        errors = [f"{names[s]}: {o[1]}" for s, o in row["sides"].items() if o[0] == "error"]
+        errors = [f"{SIDES[s]}: {o[1]}" for s, o in row["sides"].items() if o[0] == "error"]
         if errors:
             row.update(state="error", error="\n".join(errors))
         elif any(o[0] == "cancelled" for o in row["sides"].values()):
@@ -166,15 +169,17 @@ class Job:
             }
 
 
-def read_connection(data):
+def read_connection(data, side):
+    name = SIDES[side]
+    data = data or {}
     host = str(data.get("host") or "").strip()
     username = str(data.get("username") or "").strip()
     if not host or not username:
-        raise ValueError("Chưa nhập host hoặc user của Thrift.")
+        raise ValueError(f"Chưa nhập host hoặc user của Thrift {name}.")
     try:
         port = int(data.get("port"))
     except (TypeError, ValueError):
-        raise ValueError("Port không hợp lệ.") from None
+        raise ValueError(f"Port Thrift {name} không hợp lệ.") from None
     return {"host": host, "port": port, "username": username, "password": str(data.get("password") or "")}
 
 
@@ -190,6 +195,31 @@ def write_if_changed(path, content):
     with open(temp, "wb") as fh:
         fh.write(content)
     os.replace(temp, path)
+
+
+def write_sql_file(rows, prepared, date):
+    """Ghi bang va cau query cua lan chay canh file exe: phan tren Datalake, phan duoi Lakehouse."""
+    stamp = re.sub(r"[^0-9-]", "", date) or "khong_ngay"
+    path = os.path.join(DATA_DIR, f"sql_doi_soat_{stamp}.txt")
+    lines = [f"-- Câu query đối soát ngày {date or '(chưa chọn ngày)'}", ""]
+    for side, name in SIDES.items():
+        tables = [str(r.get(f"{side}_table") or "") for r in rows]
+        lines += ["=" * 60, f"-- {name.upper()}", "=" * 60, "", f"-- Bảng ({len(tables)}):"]
+        lines += [f"--   {i}. {t}" for i, t in enumerate(tables, 1)]
+        lines += ["", "-- Query:", ""]
+        for i, (table, item) in enumerate(zip(tables, prepared), 1):
+            lines.append(f"-- [{i}] {table}")
+            if item["error"]:
+                lines.append(f"-- LỖI CẤU HÌNH, không chạy: {item['error']}")
+            else:
+                lines.append(item[f"{side}_sql"] + ";")
+            lines.append("")
+    content = "\r\n".join(lines).encode("utf-8")
+    temp = path + ".tmp"
+    with open(temp, "wb") as fh:
+        fh.write(content)
+    os.replace(temp, path)
+    return path
 
 
 def read_state():
@@ -272,7 +302,11 @@ def preview():
 
 @app.post("/api/test-connection")
 def test_connection():
-    cfg = read_connection(request.get_json())
+    data = request.get_json()
+    side = data.get("side")
+    if side not in SIDES:
+        raise ValueError("Chưa chọn kết nối cần kiểm tra.")
+    cfg = read_connection(data, side)
     try:
         row = run_query(cfg, "SELECT 1", threading.Event())
     except Exception as exc:
@@ -283,7 +317,8 @@ def test_connection():
 @app.post("/api/run")
 def run():
     data = request.get_json()
-    cfg = read_connection(data)
+    connections = data.get("connections") or {}
+    cfgs = {side: read_connection(connections.get(side), side) for side in SIDES}
     try:
         threshold = Decimal(str(data.get("threshold")))
     except InvalidOperation:
@@ -300,11 +335,16 @@ def run():
         raise ValueError("Danh sách bảng đang trống.")
 
     date = str(data.get("date") or "")
-    job = Job([reconcile.prepare_row(r, date) for r in data["rows"]], cfg, threshold)
+    prepared = [reconcile.prepare_row(r, date) for r in data["rows"]]
+    job = Job(prepared, cfgs, threshold)
 
     with jobs_lock:
         if any(j.state == "running" for j in jobs.values()):
             return jsonify(error="Đang có một lượt đối soát chạy."), 409
+        try:
+            sql_path = write_sql_file(data["rows"], prepared, date)
+        except OSError as exc:
+            return jsonify(error=f"Chưa ghi được file câu query: {exc}"), 500
         jobs.clear()
         jobs[job.id] = job
 
@@ -314,7 +354,7 @@ def run():
             pool.submit(job.run_side, index, "old")
             pool.submit(job.run_side, index, "new")
     pool.shutdown(wait=False)
-    return jsonify(id=job.id)
+    return jsonify(id=job.id, sql_file=sql_path)
 
 
 def find_job(job_id):

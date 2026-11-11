@@ -2,8 +2,10 @@
 
 const POLL_MS = 1000;
 const SAVE_DELAY_MS = 300;
-const FIELDS = ["old_table", "new_table", "old_partition", "new_partition", "old_sum_columns", "new_sum_columns"];
-const CONN_FIELDS = ["host", "port", "username", "parallel"];
+const FIELDS = ["old_table", "new_table", "old_partition", "new_partition", "old_sum_columns", "new_sum_columns", "old_sql", "new_sql"];
+const SIDES = { old: "Datalake", new: "Lakehouse" };
+const CONN_KEYS = ["host", "port", "username", "password"];
+const CONN_FIELDS = [...Object.keys(SIDES).flatMap((side) => CONN_KEYS.map((k) => `${side}_${k}`)), "parallel"];
 const SETTING_FIELDS = [...CONN_FIELDS, "threshold"];
 const $ = (id) => document.getElementById(id);
 
@@ -84,8 +86,15 @@ async function restore() {
   }
   savedPath = state.path;
   rows = state.rows;
+  const settings = { ...state.settings };
+  // Cau hinh cu chi co mot Thrift: dung chung cho ca hai ben.
+  Object.keys(SIDES).forEach((side) =>
+    CONN_KEYS.forEach((k) => {
+      if (!settings[`${side}_${k}`] && settings[k]) settings[`${side}_${k}`] = settings[k];
+    })
+  );
   SETTING_FIELDS.forEach((f) => {
-    if (state.settings[f]) $(f).value = state.settings[f];
+    if (settings[f]) $(f).value = settings[f];
   });
   if (state.error) setSaved(state.error, true);
   else setSaved(`Tự động lưu tại ${savedPath}`);
@@ -100,18 +109,21 @@ function yesterday() {
 
 const isRunning = () => job !== null && job.state === "running";
 
-function connection() {
+function connection(side) {
   return {
-    host: $("host").value,
-    port: $("port").value,
-    username: $("username").value,
-    password: $("password").value,
+    host: $(`${side}_host`).value,
+    port: $(`${side}_port`).value,
+    username: $(`${side}_username`).value,
+    password: $(`${side}_password`).value,
   };
 }
 
 function updateScope() {
-  const host = $("host").value.trim();
-  $("scope").textContent = host ? `${host}:${$("port").value} · ${$("username").value.trim() || "chưa có user"}` : "Chưa kết nối Thrift";
+  Object.entries(SIDES).forEach(([side, name]) => {
+    const host = $(`${side}_host`).value.trim();
+    const user = $(`${side}_username`).value.trim() || "chưa có user";
+    $(`scope-${side}`).textContent = host ? `${name}: ${host}:${$(`${side}_port`).value} · ${user}` : `${name}: chưa cấu hình`;
+  });
 }
 
 function clearResults() {
@@ -357,7 +369,7 @@ function detailHtml(i, result, config) {
     ? `<div class="sql-stack">${["old", "new"]
         .map(
           (side) =>
-            `<div class="sql-block"><h3>Query ${side === "old" ? "Datalake" : "Lakehouse"}</h3><pre>${highlightSql(config[`${side}_sql`])}</pre><button class="copy" type="button" data-copy="${side}" data-index="${i}">Chép</button></div>`
+            `<div class="sql-block"><h3>Query ${side === "old" ? "Datalake" : "Lakehouse"}${rows[i][`${side}_sql`] ? '<span class="mark"> · tự viết</span>' : ""}</h3><pre>${highlightSql(config[`${side}_sql`])}</pre><button class="copy" type="button" data-copy="${side}" data-index="${i}">Chép</button></div>`
         )
         .join("")}</div>`
     : "";
@@ -440,16 +452,25 @@ async function poll(id) {
 }
 
 async function runAll() {
-  if (!$("host").value.trim() || !$("username").value.trim()) {
-    location.hash = "ket-noi";
-    setConnStatus("Nhập host và user của Thrift trước khi chạy.", "bad");
-    $("host").focus();
-    return;
+  for (const [side, name] of Object.entries(SIDES)) {
+    if (!$(`${side}_host`).value.trim() || !$(`${side}_username`).value.trim()) {
+      location.hash = "ket-noi";
+      setConnStatus(side, `Nhập host và user của Thrift ${name} trước khi chạy.`, "bad");
+      $(`${side}_host`).focus();
+      return;
+    }
   }
-  if (!$("password").value) {
-    $("pw-user").textContent = `Tài khoản ${$("username").value.trim()} tại ${$("host").value.trim()}. Mật khẩu không được lưu lại.`;
-    $("pw-input").value = "";
+  const missing = Object.keys(SIDES).filter((side) => !$(`${side}_password`).value);
+  if (missing.length) {
+    $("pw-user").textContent = missing
+      .map((side) => `${SIDES[side]}: ${$(`${side}_username`).value.trim()} tại ${$(`${side}_host`).value.trim()}`)
+      .join(" · ") + ". Mật khẩu sẽ được lưu để lần sau không phải nhập lại.";
+    Object.keys(SIDES).forEach((side) => {
+      $(`pw-${side}`).value = "";
+      $(`pw-${side}-label`).hidden = !missing.includes(side);
+    });
     $("pw-dialog").showModal();
+    $(`pw-${missing[0]}`).focus();
     return;
   }
   expanded = new Set();
@@ -457,13 +478,14 @@ async function runAll() {
   $("run").disabled = true;
   try {
     const body = await postJson("/api/run", {
-      ...connection(),
+      connections: { old: connection("old"), new: connection("new") },
       rows,
       date: $("date").value,
       threshold: $("threshold").value,
       parallel: $("parallel").value,
     });
     job = { id: body.id, state: "running", rows: rows.map(() => ({ state: "pending", error: "", verdict: "", metrics: [] })) };
+    setSaved(`Đã ghi câu query vào ${body.sql_file}`);
     runStarted = Date.now();
     tickClock();
     clearInterval(clockTimer);
@@ -488,23 +510,28 @@ async function stopRun() {
   $("stop").disabled = false;
 }
 
-function setConnStatus(text, kind) {
-  $("conn-status").textContent = text;
-  $("conn-status").className = `conn-status${kind ? ` ${kind}` : ""}`;
-  $("scope-dot").className = `dot${kind ? ` ${kind}` : ""}`;
+const connKinds = { old: "", new: "" };
+
+function setConnStatus(side, text, kind) {
+  $(`${side}_status`).textContent = text;
+  $(`${side}_status`).className = `conn-status${kind ? ` ${kind}` : ""}`;
+  connKinds[side] = kind || "";
+  const kinds = Object.values(connKinds);
+  const overall = kinds.includes("bad") ? "bad" : kinds.every((k) => k === "good") ? "good" : "";
+  $("scope-dot").className = `dot${overall ? ` ${overall}` : ""}`;
 }
 
-async function testConnection() {
-  $("test").disabled = true;
-  setConnStatus("Đang kết nối...");
+async function testConnection(side) {
+  $(`${side}_test`).disabled = true;
+  setConnStatus(side, "Đang kết nối...");
   try {
-    const body = await postJson("/api/test-connection", connection());
-    if (body.ok) setConnStatus("Kết nối thành công.", "good");
-    else setConnStatus(`Không kết nối được: ${body.error || "không rõ lý do"}`, "bad");
+    const body = await postJson("/api/test-connection", { side, ...connection(side) });
+    if (body.ok) setConnStatus(side, "Kết nối thành công.", "good");
+    else setConnStatus(side, `Không kết nối được: ${body.error || "không rõ lý do"}`, "bad");
   } catch (err) {
-    setConnStatus(err.message, "bad");
+    setConnStatus(side, err.message, "bad");
   }
-  $("test").disabled = false;
+  $(`${side}_test`).disabled = false;
 }
 
 async function uploadCsv(file) {
@@ -569,8 +596,32 @@ async function refreshEditor() {
     $("editor-error").textContent = item.error;
     $("editor-old-sql").innerHTML = highlightSql(item.old_sql);
     $("editor-new-sql").innerHTML = highlightSql(item.new_sql);
+    editorTemplates = { old: item.old_template || "", new: item.new_template || "" };
   }
   return item;
+}
+
+let editorTemplates = { old: "", new: "" };
+
+function showSqlEditor(side, editing) {
+  const area = $("editor-form").elements[`${side}_sql`];
+  area.hidden = !editing;
+  $(`editor-${side}-mark`).hidden = !editing;
+  document.querySelector(`[data-sql-edit="${side}"]`).textContent = editing ? "Dùng câu tự sinh" : "Sửa câu query";
+}
+
+function toggleSqlEditor(side) {
+  const area = $("editor-form").elements[`${side}_sql`];
+  if (area.hidden) {
+    // Chep cau tu sinh (con giu bien ngay) de sua tiep, thay vi go lai tu dau.
+    if (!area.value.trim()) area.value = editorTemplates[side];
+    showSqlEditor(side, true);
+    area.focus();
+  } else {
+    area.value = "";
+    showSqlEditor(side, false);
+  }
+  refreshEditor();
 }
 
 function openEditor(index) {
@@ -578,6 +629,7 @@ function openEditor(index) {
   const form = $("editor-form");
   const row = index === null ? {} : rows[index];
   FIELDS.forEach((f) => (form.elements[f].value = row[f] || ""));
+  ["old", "new"].forEach((side) => showSqlEditor(side, Boolean(row[`${side}_sql`])));
   $("editor-title").textContent = index === null ? "Thêm bảng" : "Sửa bảng";
   $("editor").showModal();
   refreshEditor();
@@ -608,13 +660,24 @@ $("editor-form").addEventListener("submit", async (event) => {
 });
 
 $("editor-cancel").addEventListener("click", () => $("editor").close());
+document.querySelectorAll("[data-sql-edit]").forEach((button) =>
+  button.addEventListener("click", () => toggleSqlEditor(button.dataset.sqlEdit))
+);
 
 $("pw-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  if (!$("pw-input").value) return;
-  $("password").value = $("pw-input").value;
-  $("pw-input").value = "";
+  const missing = Object.keys(SIDES).filter((side) => !$(`pw-${side}-label`).hidden);
+  const empty = missing.find((side) => !$(`pw-${side}`).value);
+  if (empty) {
+    $(`pw-${empty}`).focus();
+    return;
+  }
+  missing.forEach((side) => {
+    $(`${side}_password`).value = $(`pw-${side}`).value;
+    $(`pw-${side}`).value = "";
+  });
   $("pw-dialog").close();
+  save();
   runAll();
 });
 
@@ -662,7 +725,12 @@ $("search").addEventListener("input", render);
 
 $("run").addEventListener("click", runAll);
 $("stop").addEventListener("click", stopRun);
-$("test").addEventListener("click", testConnection);
+Object.keys(SIDES).forEach((side) => {
+  $(`${side}_test`).addEventListener("click", () => testConnection(side));
+  ["host", "port", "username", "password"].forEach((k) =>
+    $(`${side}_${k}`).addEventListener("input", () => setConnStatus(side, "Chưa kiểm tra kết nối."))
+  );
+});
 $("add").addEventListener("click", () => openEditor(null));
 $("export").addEventListener("click", exportResults);
 $("csv").addEventListener("change", (event) => {

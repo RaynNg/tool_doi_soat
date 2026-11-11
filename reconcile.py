@@ -12,6 +12,8 @@ FIELDS = (
     "new_partition",
     "old_sum_columns",
     "new_sum_columns",
+    "old_sql",
+    "new_sql",
 )
 REQUIRED_HEADERS = ("old_table", "new_table")
 
@@ -29,6 +31,9 @@ SUM_SPLIT_RE = re.compile(r"[|;]")
 DATE_TOKEN_RE = re.compile(r"\{(date|(?:yyyy|yy|mm|dd)(?:[-/_]?(?:yyyy|yy|mm|dd))*)\}", re.IGNORECASE)
 DATE_PARTS = {"yyyy": "%Y", "yy": "%y", "mm": "%m", "dd": "%d"}
 LEFTOVER_TOKEN_RE = re.compile(r"\{[^}]*\}")
+# Cot don gian, co the kem tien to bang/backtick: t.charge, `charge`. Bieu thuc thi khong lay lam alias.
+COLUMN_NAME_RE = re.compile(r"^\s*(?:(?:\w+|`[^`]+`)\.)*(\w+|`[^`]+`)\s*$")
+SELECT_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 
 
 def parse_csv(raw, allow_empty=False):
@@ -85,16 +90,33 @@ def prepare_row(row, date=""):
         for col in old_cols + new_cols:
             _check_fragment(col, "Cột tiền")
 
-        old_sql = _build_sql(row.get("old_table", ""), row.get("old_partition", ""), old_cols, date, "Datalake")
-        new_sql = _build_sql(row.get("new_table", ""), row.get("new_partition", ""), new_cols, date, "Lakehouse")
+        sqls, templates = {}, {}
+        for side, cols, name in (("old", old_cols, "Datalake"), ("new", new_cols, "Lakehouse")):
+            table, partition = row.get(f"{side}_table", ""), row.get(f"{side}_partition", "")
+            # Cau tu sinh giu nguyen bien ngay de nguoi dung chep ra sua.
+            templates[side] = _build_sql(table, partition, cols, None, name)
+            custom = (row.get(f"{side}_sql") or "").strip()
+            if custom:
+                if not table.strip():
+                    raise ValueError(f"Chưa nhập bảng {name}.")
+                sqls[side] = _custom_sql(custom, date, name)
+            else:
+                sqls[side] = _build_sql(table, partition, cols, date, name)
     except ValueError as exc:
-        return {"error": str(exc), "old_sql": "", "new_sql": "", "metrics": []}
+        return {"error": str(exc), "old_sql": "", "new_sql": "", "old_template": "", "new_template": "", "metrics": []}
 
     metrics = [{"label": "Số dòng", "kind": "count"}]
     for old_col, new_col in zip(old_cols, new_cols):
         label = old_col if old_col == new_col else f"{old_col} → {new_col}"
         metrics.append({"label": label, "kind": "sum"})
-    return {"error": "", "old_sql": old_sql, "new_sql": new_sql, "metrics": metrics}
+    return {
+        "error": "",
+        "old_sql": sqls["old"],
+        "new_sql": sqls["new"],
+        "old_template": templates["old"],
+        "new_template": templates["new"],
+        "metrics": metrics,
+    }
 
 
 def _split_columns(value):
@@ -106,8 +128,18 @@ def _check_fragment(text, name):
         raise ValueError(f"{name} không được chứa ; hoặc chú thích SQL: {text}")
 
 
+def _custom_sql(text, date, name):
+    """Cau query tu viet: chi mot cau SELECT, tra ve COUNT roi den cac SUM theo dung thu tu cot tien."""
+    sql = text.strip().rstrip(";").strip()
+    if ";" in sql:
+        raise ValueError(f"Query {name} chỉ được có một câu, không chứa dấu ; ở giữa.")
+    if not SELECT_RE.match(sql):
+        raise ValueError(f"Query {name} phải bắt đầu bằng SELECT hoặc WITH.")
+    return _fill_date(sql, date, f"Query {name}")
+
+
 def _fill_date(text, date, name):
-    if not DATE_TOKEN_RE.search(text):
+    if date is None or not DATE_TOKEN_RE.search(text):
         return text
     if not date:
         raise ValueError(f"{name} có dùng biến ngày nhưng chưa chọn ngày đối soát.")
@@ -125,6 +157,17 @@ def _fill_date(text, date, name):
     return DATE_TOKEN_RE.sub(expand, text)
 
 
+def _sum_alias(col, index, used):
+    """Lay ten cot lam alias (SUM(charge) AS charge); bieu thuc hoac ten trung thi dung sum_<i>."""
+    match = COLUMN_NAME_RE.match(col)
+    alias = match.group(1) if match else ""
+    key = alias.strip("`").lower()
+    if not alias or key in used:
+        alias, key = f"sum_{index}", f"sum_{index}"
+    used.add(key)
+    return alias
+
+
 def _build_sql(table, partition, columns, date, side):
     table = _fill_date(table.strip(), date, f"Bảng {side}")
     if not table:
@@ -135,12 +178,14 @@ def _build_sql(table, partition, columns, date, side):
     where = WHERE_PREFIX_RE.sub("", partition.strip())
     where = _fill_date(where, date, f"Partition {side}")
     _check_fragment(where, f"Partition {side}")
-    leftover = LEFTOVER_TOKEN_RE.search(where)
+    leftover = LEFTOVER_TOKEN_RE.search(where) if date is not None else None
     if leftover:
         raise ValueError(f"Partition {side} có biến ngày không hỗ trợ: {leftover.group()}")
 
     selects = ["COUNT(*) AS cnt"]
-    selects += [f"SUM({col}) AS sum_{i}" for i, col in enumerate(columns, 1)]
+    used = {"cnt"}
+    for i, col in enumerate(columns, 1):
+        selects.append(f"SUM({col}) AS {_sum_alias(col, i, used)}")
     sql = "SELECT " + ",\n       ".join(selects) + f"\nFROM {table}"
     if where:
         sql += f"\nWHERE {where}"
@@ -165,6 +210,11 @@ def compare(metrics, old_values, new_values, threshold):
 
     NULL (bang rong hoac toan NULL) duoc tinh la 0.
     """
+    for side, values in (("Datalake", old_values), ("Lakehouse", new_values)):
+        if values is None or len(values) != len(metrics):
+            got = 0 if values is None else len(values)
+            names = ", ".join(m["label"] for m in metrics)
+            raise ValueError(f"Query {side} trả về {got} cột, cần {len(metrics)} cột theo thứ tự: {names}.")
     result = []
     with localcontext(Context(prec=80)):
         for metric, raw_old, raw_new in zip(metrics, old_values, new_values):
