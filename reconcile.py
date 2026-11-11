@@ -1,8 +1,10 @@
 """Doc CSV, sinh cau SQL va so sanh ket qua giua Datalake va Lakehouse."""
+import calendar
 import csv
 import io
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Context, Decimal, InvalidOperation, localcontext
 
 FIELDS = (
@@ -19,8 +21,8 @@ REQUIRED_HEADERS = ("old_table", "new_table")
 
 TEMPLATE_CSV = (
     ",".join(FIELDS) + "\n"
-    "old_db.giao_dich,new_db.giao_dich,dt='{date}',data_date={yyyymmdd},so_tien|phi,amount|fee\n"
-    "old_db.cuoc,new_db.cuoc,mon={yymm} AND pay_type=2,mon={yyyymm} AND pay_type=2,tien_cuoc,\n"
+    "old_db.giao_dich,new_db.giao_dich,partition=${YYYYMMDD:DD-1},partition=${YYYYMMDD:DD-1},so_tien|phi,amount|fee\n"
+    "old_db.cuoc,new_db.cuoc,mon=${YYMM:DD-1} AND pay_type=2,mon=${YYYYMM:DD-1} AND pay_type=2,tien_cuoc,\n"
     "old_db.tai_khoan,new_db.tai_khoan_v2,,,so_du,\n"
 )
 
@@ -34,6 +36,14 @@ LEFTOVER_TOKEN_RE = re.compile(r"\{[^}]*\}")
 # Cot don gian, co the kem tien to bang/backtick: t.charge, `charge`. Bieu thuc thi khong lay lam alias.
 COLUMN_NAME_RE = re.compile(r"^\s*(?:(?:\w+|`[^`]+`)\.)*(\w+|`[^`]+`)\s*$")
 SELECT_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+
+# Bien thoi gian theo Bien.txt, viet dang ${YYYYMMDD:DD-1}. Moc tinh (ngay N) = ngay doi soat + 1, gio hien tai,
+# nen mac dinh (doi soat hom qua) thi N la luc dang chay va ${YYYYMMDD:DD-1} chinh la ngay doi soat.
+VARIABLE_RE = re.compile(r"\$\{([^}]*)\}")
+JAVA_FORMAT_RE = re.compile(r"yyyy|yy|MM|M|dd|HH|mm|ss")
+# File canh exe (nguoi dung tu them bien) duoc uu tien hon ban dong goi kem.
+VARIABLE_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "Bien.txt")]
+_variable_cache = {}
 
 
 def parse_csv(raw, allow_empty=False):
@@ -78,8 +88,76 @@ def _decode(raw):
         return raw.decode("cp1258", errors="replace")
 
 
-def prepare_row(row, date=""):
-    """Sinh SQL cho mot dong. Dong sai cau hinh tra ve khoa `error`."""
+def load_variables():
+    """Doc bang bien thoi gian tu file Bien.txt dau tien tim thay; doc lai khi file thay doi."""
+    path = next((p for p in VARIABLE_FILES if os.path.isfile(p)), None)
+    if path is None:
+        return {}
+    stamp = (path, os.path.getmtime(path))
+    if _variable_cache.get("stamp") != stamp:
+        with open(path, "rb") as fh:
+            reader = csv.DictReader(io.StringIO(_decode(fh.read())))
+            reader.fieldnames = [(h or "").strip().upper() for h in reader.fieldnames or []]
+            table = {}
+            for record in reader:
+                name = (record.get("NAME") or "").strip()
+                if not name:
+                    continue
+                try:
+                    shift = {k: int(record.get(k) or 0) for k in ("ADD_DAY", "ADD_MON", "ADD_YEAR", "ADD_MIN", "ADD_HOUR")}
+                except ValueError:
+                    continue
+                table[name.upper()] = {
+                    **shift,
+                    "format": (record.get("FORMAT") or "").strip(),
+                    "last_day": "LAST_M" in (record.get("EXTEND_FORMAT") or "").upper(),
+                }
+        _variable_cache.update(stamp=stamp, table=table)
+    return _variable_cache["table"]
+
+
+def _add_months(moment, months):
+    # Giong Java Calendar: 31/03 lui 1 thang thanh 28 (29)/02.
+    total = moment.year * 12 + moment.month - 1 + months
+    year, month = divmod(total, 12)
+    day = min(moment.day, calendar.monthrange(year, month + 1)[1])
+    return moment.replace(year=year, month=month + 1, day=day)
+
+
+def _java_format(moment, pattern):
+    parts = {
+        "yyyy": f"{moment.year:04d}", "yy": f"{moment.year % 100:02d}", "MM": f"{moment.month:02d}",
+        "M": str(moment.month), "dd": f"{moment.day:02d}", "HH": f"{moment.hour:02d}",
+        "mm": f"{moment.minute:02d}", "ss": f"{moment.second:02d}",
+    }
+    return JAVA_FORMAT_RE.sub(lambda m: parts[m.group()], pattern)
+
+
+def eval_variable(name, base):
+    spec = load_variables().get(name.strip().upper())
+    if spec is None:
+        return None
+    moment = base + timedelta(days=spec["ADD_DAY"])
+    moment = _add_months(moment, spec["ADD_MON"] + 12 * spec["ADD_YEAR"])
+    moment += timedelta(minutes=spec["ADD_MIN"], hours=spec["ADD_HOUR"])
+    if spec["last_day"]:
+        moment = moment.replace(day=calendar.monthrange(moment.year, moment.month)[1])
+    return _java_format(moment, spec["format"])
+
+
+def base_time(date, now=None):
+    """Ngay N de tinh bien: ngay doi soat + 1, giu gio hien tai."""
+    now = now or datetime.now()
+    parsed = datetime.strptime(date, "%Y-%m-%d")
+    return datetime.combine(parsed.date() + timedelta(days=1), now.time().replace(microsecond=0))
+
+
+def prepare_row(row, date="", now=None):
+    """Sinh SQL cho mot dong. Dong sai cau hinh tra ve khoa `error`.
+
+    now: thoi diem chay, truyen chung cho ca luot de moi bang dung cung gia tri bien gio/phut.
+    """
+    now = now or datetime.now()
     try:
         old_cols = _split_columns(row.get("old_sum_columns", ""))
         new_cols = _split_columns(row.get("new_sum_columns", "")) or old_cols
@@ -94,14 +172,14 @@ def prepare_row(row, date=""):
         for side, cols, name in (("old", old_cols, "Datalake"), ("new", new_cols, "Lakehouse")):
             table, partition = row.get(f"{side}_table", ""), row.get(f"{side}_partition", "")
             # Cau tu sinh giu nguyen bien ngay de nguoi dung chep ra sua.
-            templates[side] = _build_sql(table, partition, cols, None, name)
+            templates[side] = _build_sql(table, partition, cols, None, name, now)
             custom = (row.get(f"{side}_sql") or "").strip()
             if custom:
                 if not table.strip():
                     raise ValueError(f"Chưa nhập bảng {name}.")
-                sqls[side] = _custom_sql(custom, date, name)
+                sqls[side] = _custom_sql(custom, date, name, now)
             else:
-                sqls[side] = _build_sql(table, partition, cols, date, name)
+                sqls[side] = _build_sql(table, partition, cols, date, name, now)
     except ValueError as exc:
         return {"error": str(exc), "old_sql": "", "new_sql": "", "old_template": "", "new_template": "", "metrics": []}
 
@@ -128,18 +206,18 @@ def _check_fragment(text, name):
         raise ValueError(f"{name} không được chứa ; hoặc chú thích SQL: {text}")
 
 
-def _custom_sql(text, date, name):
+def _custom_sql(text, date, name, now):
     """Cau query tu viet: chi mot cau SELECT, tra ve COUNT roi den cac SUM theo dung thu tu cot tien."""
     sql = text.strip().rstrip(";").strip()
     if ";" in sql:
         raise ValueError(f"Query {name} chỉ được có một câu, không chứa dấu ; ở giữa.")
     if not SELECT_RE.match(sql):
         raise ValueError(f"Query {name} phải bắt đầu bằng SELECT hoặc WITH.")
-    return _fill_date(sql, date, f"Query {name}")
+    return _fill_date(sql, date, f"Query {name}", now)
 
 
-def _fill_date(text, date, name):
-    if date is None or not DATE_TOKEN_RE.search(text):
+def _fill_date(text, date, name, now=None):
+    if date is None or not (DATE_TOKEN_RE.search(text) or VARIABLE_RE.search(text)):
         return text
     if not date:
         raise ValueError(f"{name} có dùng biến ngày nhưng chưa chọn ngày đối soát.")
@@ -147,6 +225,16 @@ def _fill_date(text, date, name):
         parsed = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         raise ValueError(f"Ngày đối soát không hợp lệ: {date}") from None
+
+    base = base_time(date, now)
+
+    def expand_variable(match):
+        value = eval_variable(match.group(1), base)
+        if value is None:
+            raise ValueError(f"{name} dùng biến thời gian không có trong Bien.txt: {match.group()}")
+        return value
+
+    text = VARIABLE_RE.sub(expand_variable, text)
 
     def expand(match):
         token = match.group(1).lower()
@@ -168,15 +256,15 @@ def _sum_alias(col, index, used):
     return alias
 
 
-def _build_sql(table, partition, columns, date, side):
-    table = _fill_date(table.strip(), date, f"Bảng {side}")
+def _build_sql(table, partition, columns, date, side, now=None):
+    table = _fill_date(table.strip(), date, f"Bảng {side}", now)
     if not table:
         raise ValueError(f"Chưa nhập bảng {side}.")
     if not TABLE_RE.match(table):
         raise ValueError(f"Tên bảng {side} không hợp lệ: {table}")
 
     where = WHERE_PREFIX_RE.sub("", partition.strip())
-    where = _fill_date(where, date, f"Partition {side}")
+    where = _fill_date(where, date, f"Partition {side}", now)
     _check_fragment(where, f"Partition {side}")
     leftover = LEFTOVER_TOKEN_RE.search(where) if date is not None else None
     if leftover:

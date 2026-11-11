@@ -132,6 +132,7 @@
                 <label
                   >Ngày đối soát
                   <input id="date" class="num" type="date" />
+                  <small id="base-note" class="base-note"></small>
                 </label>
                 <label
                   >Ngưỡng lệch (%)
@@ -590,7 +591,7 @@
             >Partition Lakehouse (để trống nếu không có)<input
               name="new_partition"
               spellcheck="false"
-              placeholder="`partition`={yyyymmdd}"
+              placeholder="partition=${YYYYMMDD:DD-1}"
           /></label>
           <label
             >Cột tiền Datalake, cách nhau bằng |<input
@@ -607,9 +608,15 @@
         </div>
         <p class="hint">
           Partition là điều kiện WHERE, nhiều điều kiện nối bằng AND, giá trị
-          chuỗi phải có dấu nháy. Biến ngày lấy theo ô Ngày đối soát, ví dụ với
-          ngày 2026-11-09: {yymm} là 2611, {yyyymm} là 202611, {yyyymmdd} là
-          20261109, {date} là 2026-11-09. Ghép tự do từ yyyy, yy, mm, dd.
+          chuỗi phải có dấu nháy. Biến thời gian theo Bien.txt viết dạng
+          ${TÊN_BIẾN}, tính từ ngày N = Ngày đối soát + 1 với giờ lúc chạy. Ví dụ
+          đối soát ngày 10/11/2026, chạy lúc 15:17:30: ${YYYYMMDD:DD-1} là
+          20261110, ${YYYYMMDDHH24MMSS:HH-1} là 20261111141730, ${YYYYMM01} là
+          20261101.
+        </p>
+        <p class="hint">
+          Biến cũ vẫn dùng được, lấy đúng Ngày đối soát: {yyyymmdd}, {yyyymm},
+          {yymm}, {date} (dạng 2026-11-10).
         </p>
         <p class="hint">
           Muốn viết query riêng thì bấm Sửa câu query. Câu tự viết phải trả về 1

@@ -8,6 +8,7 @@ import threading
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from flask import Flask, Response, jsonify, request, send_from_directory
@@ -23,6 +24,8 @@ BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 # Exe giai nen vao thu muc tam nen du lieu phai luu canh file exe.
 DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+# Bien.txt canh exe (nguoi dung tu them bien) uu tien hon ban dong goi trong exe.
+reconcile.VARIABLE_FILES.insert(0, os.path.join(DATA_DIR, "Bien.txt"))
 ROWS_FILE = "danh_sach_bang.csv"
 SETTINGS_FILE = "cau_hinh.json"
 SIDES = {"old": "Datalake", "new": "Lakehouse"}
@@ -331,7 +334,12 @@ def parse_csv():
 def preview():
     data = request.get_json()
     date = str(data.get("date") or "")
-    return jsonify(rows=[reconcile.prepare_row(r, date) for r in data.get("rows", [])])
+    now = datetime.now()
+    try:
+        base = reconcile.base_time(date, now).strftime("%d/%m/%Y %H:%M:%S")
+    except ValueError:
+        base = ""
+    return jsonify(rows=[reconcile.prepare_row(r, date, now) for r in data.get("rows", [])], base=base)
 
 
 @app.post("/api/test-connection")
@@ -378,7 +386,8 @@ def run():
             raise ValueError("Danh sách bảng cần chạy không hợp lệ.")
 
     date = str(data.get("date") or "")
-    prepared = [reconcile.prepare_row(r, date) for r in data["rows"]]
+    now = datetime.now()
+    prepared = [reconcile.prepare_row(r, date, now) for r in data["rows"]]
     job = Job(prepared, cfgs, threshold, selected)
     picked = [i for i in range(len(prepared)) if selected is None or i in selected]
 

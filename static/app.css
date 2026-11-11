@@ -72,6 +72,7 @@ h1 { font-size: 26px; line-height: 34px; font-weight: 700; letter-spacing: -.015
 .finding { margin-top: 6px; max-width: 560px; min-height: 20px; font-weight: 500; color: #fff; }
 .run-controls { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-top: 20px; }
 .hero label { color: #ffe9ed; }
+.base-note { display: block; height: 0; margin-top: 4px; overflow: visible; white-space: nowrap; font-size: 11px; line-height: 14px; font-weight: 400; color: #ffd7df; }
 .hero input { width: 156px; color: var(--navy); background: #fff; border-color: #fff; }
 .hero input[type=number] { width: 104px; }
 .hero input:hover { border-color: #ffd0da; }

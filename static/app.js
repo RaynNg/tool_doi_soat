@@ -163,6 +163,7 @@ async function refreshPreview() {
     const body = await postJson("/api/preview", { rows, date: $("date").value });
     if (seq !== previewSeq) return;
     prepared = body.rows;
+    $("base-note").textContent = body.base ? `Biến tính với N = ${body.base}` : "";
   } catch (err) {
     setFinding(err.message, "bad");
     return;
