@@ -185,6 +185,9 @@ th.num { font-family: var(--font); }
 #table tr.row.open > td { border-bottom-color: transparent; }
 #table tr.row.open > td:first-child { border-bottom-left-radius: 0; }
 #table tr.row.open > td:last-child { border-bottom-right-radius: 0; }
+.col-check { width: 40px; }
+.col-check input, .pick { width: 16px; height: 16px; margin: 0; vertical-align: middle; accent-color: var(--brand); cursor: pointer; }
+.col-check input:disabled, .pick:disabled { cursor: default; }
 .col-open { width: 48px; }
 .col-act { width: 132px; }
 .toggle { width: 28px; height: 28px; padding: 0; color: var(--muted); background: var(--raised); border: 0; border-radius: 8px; cursor: pointer; transition: background .14s, color .14s; }

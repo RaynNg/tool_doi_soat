@@ -25,6 +25,8 @@ let rows = [];
 let prepared = [];
 let job = null;
 let expanded = new Set();
+// Cac dong duoc tick: bam Chay doi soat chi chay cac dong nay, khong tick dong nao thi chay tat ca.
+let selected = new Set();
 let editingIndex = null;
 let previewTimer = null;
 let previewSeq = 0;
@@ -173,6 +175,7 @@ function rowEdited(change) {
 
 function rowsChanged() {
   clearResults();
+  selected = new Set();
   save();
   render();
   schedulePreview();
@@ -498,7 +501,7 @@ function detailHtml(i, result, config) {
   const left = errorText
     ? `<p class="error-text">${esc(errorText)}</p>${table}`
     : table || '<p class="dash">Chưa có kết quả, bấm Chạy đối soát.</p>';
-  return `<tr class="detail is-${statusOf(i)}"><td colspan="7"><div class="detail-grid"><div>${left}</div>${sql}</div></td></tr>`;
+  return `<tr class="detail is-${statusOf(i)}"><td colspan="8"><div class="detail-grid"><div>${left}</div>${sql}</div></td></tr>`;
 }
 
 function rowHtml(row, i) {
@@ -512,6 +515,7 @@ function rowHtml(row, i) {
     ? `<div class="stack"><div>${numCell(count.old)}</div><div>${numCell(count.new)}</div></div>`
     : '<span class="dash">—</span>';
   return `<tr class="row is-${statusOf(i)}${open ? " open" : ""}" id="row-${i}">
+    <td><input class="pick" type="checkbox" data-pick="${i}" aria-label="Chọn dòng ${i + 1}"${selected.has(i) ? " checked" : ""}${locked}></td>
     <td><button class="toggle" type="button" data-toggle="${i}" aria-expanded="${open}" aria-label="Xem chi tiết dòng ${i + 1}">${CHEVRON}</button></td>
     <td class="tables">${sideLines(row.old_table, row.new_table, "chưa nhập", tableLabel)}</td>
     <td class="parts">${sideLines(row.old_partition, row.new_partition, "không có", partitionLabel)}</td>
@@ -530,6 +534,22 @@ function matches(row, i) {
   );
 }
 
+function visibleIndices() {
+  return rows.map((row, i) => (matches(row, i) ? i : -1)).filter((i) => i >= 0);
+}
+
+function renderSelection() {
+  const shown = visibleIndices();
+  const picked = shown.filter((i) => selected.has(i)).length;
+  const all = $("check-all");
+  all.checked = shown.length > 0 && picked === shown.length;
+  all.indeterminate = picked > 0 && picked < shown.length;
+  all.disabled = isRunning() || shown.length === 0;
+  $("run-label").textContent = selected.size
+    ? `Chạy ${selected.size} bảng đã chọn`
+    : "Chạy đối soát";
+}
+
 function render() {
   const counts = tally();
   const visible = rows
@@ -543,6 +563,7 @@ function render() {
   renderBridge(counts);
   renderTape();
   renderFinding(counts);
+  renderSelection();
   $("run").hidden = isRunning();
   $("run").disabled = rows.length === 0;
   $("stop").hidden = !isRunning();
@@ -921,6 +942,22 @@ $("pw-form").addEventListener("submit", (event) => {
 
 $("pw-cancel").addEventListener("click", () => $("pw-dialog").close());
 
+$("rows").addEventListener("change", (event) => {
+  const box = event.target.closest("[data-pick]");
+  if (!box) return;
+  const i = Number(box.dataset.pick);
+  if (box.checked) selected.add(i);
+  else selected.delete(i);
+  renderSelection();
+});
+
+$("check-all").addEventListener("change", (event) => {
+  visibleIndices().forEach((i) =>
+    event.target.checked ? selected.add(i) : selected.delete(i),
+  );
+  render();
+});
+
 $("rows").addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
@@ -945,6 +982,9 @@ $("rows").addEventListener("click", (event) => {
     const i = Number(button.dataset.remove);
     rows.splice(i, 1);
     prepared = [];
+    selected = new Set(
+      [...selected].filter((j) => j !== i).map((j) => (j > i ? j - 1 : j)),
+    );
     rowEdited((results) => results.splice(i, 1));
   }
 });
@@ -969,7 +1009,10 @@ document.querySelector(".tabs").addEventListener("click", (event) => {
 
 $("search").addEventListener("input", render);
 
-$("run").addEventListener("click", () => runAll());
+// Co tick thi chay rieng cac dong da chon, khong tick dong nao thi chay tat ca.
+$("run").addEventListener("click", () =>
+  runAll(selected.size ? [...selected].sort((a, b) => a - b) : null),
+);
 $("stop").addEventListener("click", stopRun);
 Object.keys(SIDES).forEach((side) => {
   $(`${side}_test`).addEventListener("click", () => testConnection(side));

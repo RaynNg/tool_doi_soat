@@ -157,7 +157,7 @@
                   >
                     <path d="M4 2.5v11l9-5.5z" fill="currentColor" />
                   </svg>
-                  Chạy đối soát
+                  <span id="run-label">Chạy đối soát</span>
                 </button>
               </div>
             </div>
@@ -371,6 +371,14 @@
               <table id="table">
                 <thead>
                   <tr>
+                    <th class="col-check">
+                      <input
+                        id="check-all"
+                        type="checkbox"
+                        title="Chọn tất cả bảng đang hiển thị"
+                        aria-label="Chọn tất cả bảng đang hiển thị"
+                      />
+                    </th>
                     <th class="col-open"></th>
                     <th>Bảng</th>
                     <th>Partition</th>
