@@ -25,7 +25,7 @@ Mã thoát của script: 0 khớp hết, 1 có bảng lệch (khi FAIL_ON_MISMAT
     <parameter>
       <name>RUN_DATE</name>
       <default_value/>
-      <description>Ngày đối soát YYYY-MM-DD, để trống là hôm qua. Airflow truyền {{ ds }}</description>
+      <description>Ngày đối soát YYYY-MM-DD = ngày N của biến (biến DD-1 ra N-1), để trống là hôm nay. Airflow truyền {{ data_interval_end | ds }}</description>
     </parameter>
     <parameter>
       <name>ROWS_FILE</name>

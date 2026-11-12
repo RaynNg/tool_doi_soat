@@ -9,7 +9,6 @@ import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 import thrift_sasl
@@ -36,7 +35,12 @@ FIRST_PORT = 8765
 PORT_ATTEMPTS = 20
 POLL_SECONDS = 1.0
 CONNECT_TIMEOUT_SECONDS = 5
-# Moi lenh Thrift (bat tay, mo session, poll trang thai) deu tra ve nhanh vi query chay async.
+# Bat tay SASL + mo session binh thuong xong trong vai giay: timeout ngan roi thu lai nhieu lan
+# thi bao loi nhanh va vuot qua duoc mang chap chon, thay vi treo mot lan rat lau.
+HANDSHAKE_TIMEOUT_SECONDS = 15
+CONNECT_RETRIES = 3
+RETRY_DELAYS_SECONDS = (2, 4, 8)
+# Sau khi ket noi, moi lenh Thrift (submit, poll trang thai, lay ket qua) deu tra ve nhanh vi query chay async.
 RPC_TIMEOUT_SECONDS = 60
 MAX_PARALLEL = 16
 ERROR_TEXT_LIMIT = 2000
@@ -61,13 +65,20 @@ class QueryFailed(Exception):
     pass
 
 
-def connect(cfg):
+class ConnectRetryable(Exception):
+    """Loi ket noi tam thoi (mang, timeout, server dong ket noi): dang thu lai."""
+
+
+def connect_once(cfg):
     # PyHive khong co timeout ket noi, kiem tra truoc de bao loi nhanh khi sai host/port.
-    socket.create_connection((cfg["host"], cfg["port"]), timeout=CONNECT_TIMEOUT_SECONDS).close()
+    try:
+        socket.create_connection((cfg["host"], cfg["port"]), timeout=CONNECT_TIMEOUT_SECONDS).close()
+    except OSError as exc:
+        raise ConnectRetryable(f"Không mở được cổng {cfg['host']}:{cfg['port']}: {exc}") from None
     # Tu dung transport de dat timeout: server chay HTTP/SSL hoac khac kieu xac thuc se khong tra loi
     # buoc bat tay SASL, khong co timeout thi PyHive treo vinh vien.
     sock = TSocket.TSocket(cfg["host"], cfg["port"])
-    sock.setTimeout(RPC_TIMEOUT_SECONDS * 1000)
+    sock.setTimeout(HANDSHAKE_TIMEOUT_SECONDS * 1000)
     transport = thrift_sasl.TSaslClientTransport(
         lambda: hive.get_installed_sasl(
             host=cfg["host"], sasl_auth="PLAIN", username=cfg["username"], password=cfg["password"]
@@ -76,19 +87,42 @@ def connect(cfg):
         sock,
     )
     try:
-        return hive.connect(username=cfg["username"], thrift_transport=transport)
+        conn = hive.connect(username=cfg["username"], thrift_transport=transport)
     except TTransportException as exc:
-        if exc.type != TTransportException.TIMED_OUT:
-            raise
-        raise QueryFailed(
-            f"Đã mở được cổng nhưng server không phản hồi bước xác thực sau {RPC_TIMEOUT_SECONDS} giây. "
-            "Kiểm tra trong DBeaver xem URL JDBC có transportMode=http, ssl=true hay xác thực "
-            "khác LDAP (Kerberos/NOSASL) không."
-        ) from None
+        transport.close()
+        if exc.type == TTransportException.TIMED_OUT:
+            raise ConnectRetryable(
+                f"Đã mở được cổng nhưng server không phản hồi bước xác thực sau {HANDSHAKE_TIMEOUT_SECONDS} giây. "
+                "Nếu lần nào cũng vậy, kiểm tra trong DBeaver xem URL JDBC có transportMode=http, ssl=true "
+                "hay xác thực khác LDAP (Kerberos/NOSASL) không."
+            ) from None
+        if exc.type == TTransportException.END_OF_FILE:
+            raise ConnectRetryable(f"Server đóng kết nối giữa chừng: {exc}") from None
+        # Con lai (thuong la sai user/mat khau): khong thu lai de tranh khoa tai khoan LDAP.
+        raise
+    except OSError as exc:
+        transport.close()
+        raise ConnectRetryable(f"Mất kết nối khi xác thực: {exc}") from None
+    # Da ket noi: poll/lay ket qua duoc cho lau hon.
+    sock.setTimeout(RPC_TIMEOUT_SECONDS * 1000)
+    return conn
+
+
+def connect(cfg, cancel):
+    """Thu ket noi nhieu lan voi timeout ngan; chi thu lai loi tam thoi, khong thu lai sai mat khau."""
+    for attempt in range(CONNECT_RETRIES + 1):
+        try:
+            return connect_once(cfg)
+        except ConnectRetryable as exc:
+            if attempt == CONNECT_RETRIES:
+                raise QueryFailed(f"{exc} (đã thử {CONNECT_RETRIES + 1} lần)") from None
+            if cancel.wait(RETRY_DELAYS_SECONDS[min(attempt, len(RETRY_DELAYS_SECONDS) - 1)]):
+                raise QueryCancelled() from None
 
 
 def run_query(cfg, sql, cancel):
-    conn = connect(cfg)
+    # Chi thu lai buoc ket noi; query da gui len server thi khong chay lai de tranh tai gap doi.
+    conn = connect(cfg, cancel)
     try:
         cursor = conn.cursor()
         cursor.execute(sql, async_=True)
@@ -197,7 +231,10 @@ class Job:
         else:
             try:
                 metrics = reconcile.compare(
-                    row["prepared"]["metrics"], row["sides"]["old"][1], row["sides"]["new"][1], self.threshold
+                    row["prepared"]["metrics"],
+                    row["sides"]["old"][1],
+                    row["sides"]["new"][1],
+                    reconcile.row_threshold(row["prepared"], self.threshold),
                 )
                 row.update(state="done", metrics=metrics, verdict=reconcile.verdict(metrics))
             except ValueError as exc:
@@ -374,12 +411,9 @@ def run():
     data = request.get_json()
     connections = data.get("connections") or {}
     cfgs = {side: read_connection(connections.get(side), side) for side in SIDES}
-    try:
-        threshold = Decimal(str(data.get("threshold")))
-    except InvalidOperation:
-        raise ValueError("Ngưỡng chênh lệch không hợp lệ.") from None
-    if not threshold.is_finite() or threshold < 0:
-        raise ValueError("Ngưỡng chênh lệch phải là số không âm.")
+    threshold = reconcile.parse_threshold(data.get("threshold"))
+    if threshold is None:
+        raise ValueError("Chưa nhập ngưỡng chênh lệch chung.")
     try:
         parallel = int(data.get("parallel"))
     except (TypeError, ValueError):

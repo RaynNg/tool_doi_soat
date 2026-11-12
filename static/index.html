@@ -135,7 +135,7 @@
                   <small id="base-note" class="base-note"></small>
                 </label>
                 <label
-                  >Ngưỡng lệch (%)
+                  >Ngưỡng lệch chung (%)
                   <input
                     id="threshold"
                     class="num"
@@ -619,6 +619,15 @@
               name="new_sum_columns"
               spellcheck="false"
               placeholder="amount|fee"
+          /></label>
+          <label
+            >Ngưỡng lệch riêng (%) (để trống thì dùng ngưỡng chung)<input
+              name="threshold"
+              class="num"
+              type="number"
+              min="0"
+              step="any"
+              placeholder="theo ngưỡng chung"
           /></label>
         </div>
         <p id="editor-error" class="error-text" role="alert"></p>

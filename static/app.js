@@ -11,6 +11,7 @@ const FIELDS = [
   "new_sum_columns",
   "old_sql",
   "new_sql",
+  "threshold",
 ];
 const SIDES = { old: "Datalake", new: "Lakehouse" };
 const CONN_KEYS = ["host", "port", "username", "password"];
@@ -130,9 +131,9 @@ async function restore() {
   else setSaved(`Tự động lưu tại ${savedPath}`);
 }
 
-function yesterday() {
+// Ngay doi soat la ngay N cua bien: mac dinh hom nay, ${YYYYMMDD:DD-1} ra hom qua.
+function today() {
   const d = new Date();
-  d.setDate(d.getDate() - 1);
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
@@ -181,7 +182,7 @@ function rowsChanged() {
   schedulePreview();
 }
 
-// N = ngay doi soat + 1, gio chay theo dong ho that; luc chay moi bang lay N tai thoi diem bat dau bang do.
+// N = ngay doi soat, gio chay theo dong ho that; luc chay moi bang lay N tai thoi diem bat dau bang do.
 let baseOffset = null;
 function setBase(text) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4}) (\d{2}):(\d{2}):(\d{2})$/.exec(
@@ -275,6 +276,11 @@ function tally() {
   return counts;
 }
 
+// Nguong rieng cua bang neu co, khong thi nguong chung.
+const ownThreshold = (i) =>
+  rows[i] ? String(rows[i].threshold || "").trim().replace(/%$/, "").replace(",", ".") : "";
+const limitOf = (i) => ownThreshold(i) || $("threshold").value;
+
 function tableName(i) {
   return rows[i] ? rows[i].new_table || rows[i].old_table : "";
 }
@@ -290,7 +296,7 @@ function renderFinding(counts) {
     else
       setFinding(
         rows.length
-          ? `${rows.length} bảng sẵn sàng đối soát với ngưỡng ${limit}.`
+          ? `${rows.length} bảng sẵn sàng đối soát, ngưỡng chung ${limit}${rows.some((_, i) => ownThreshold(i)) ? ", có bảng dùng ngưỡng riêng" : ""}.`
           : "Chưa có bảng nào trong danh sách.",
       );
     return;
@@ -318,7 +324,7 @@ function renderFinding(counts) {
       (names.length > 3 ? ` và ${names.length - 3} bảng khác` : "");
     const parts = [];
     if (counts.lech)
-      parts.push(`${counts.lech} bảng lệch quá ${limit}: ${shown}`);
+      parts.push(`${counts.lech} bảng lệch vượt ngưỡng: ${shown}`);
     if (counts.loi) parts.push(`${counts.loi} bảng lỗi query`);
     setFinding(`${parts.join(". ")}.`, "bad");
     return;
@@ -327,7 +333,7 @@ function renderFinding(counts) {
     ? ` Có ${counts.trong} bảng 0 dòng ở cả hai bên, nên kiểm tra lại partition.`
     : "";
   setFinding(
-    `Tất cả ${counts.ok + counts.trong} bảng nằm trong ngưỡng ${limit}.${note}`,
+    `Tất cả ${counts.ok + counts.trong} bảng nằm trong ngưỡng.${note}`,
     counts.trong ? "" : "good",
   );
 }
@@ -441,8 +447,8 @@ function shortPct(metric) {
 }
 
 // Vach giua thanh la nguong, nen thanh dai gap doi nguong.
-function meter(label, metric) {
-  const limit = Number($("threshold").value) || 0;
+function meter(label, metric, i) {
+  const limit = Number(limitOf(i)) || 0;
   const value = Number(metric.pct);
   let share = 0;
   if (metric.pct === null) share = 100;
@@ -456,10 +462,14 @@ function meter(label, metric) {
   return `<div class="meter-row${metric.ok ? "" : " over"}"><span>${label}</span><div class="meter"><i style="width:${share}%"></i></div><em class="num">${esc(shortPct(metric))}</em></div>`;
 }
 
-function meters(metrics) {
-  if (!metrics.length) return '<span class="dash">—</span>';
+function meters(metrics, i) {
+  const own = ownThreshold(i);
+  const tag = own
+    ? `<small class="own-limit" title="Ngưỡng riêng của bảng này">Ngưỡng riêng ${esc(own)}%</small>`
+    : "";
+  if (!metrics.length) return tag || '<span class="dash">—</span>';
   const money = worstSum(metrics);
-  return `<div class="meters" title="Vạch giữa là ngưỡng ${esc($("threshold").value)}%">${meter("Số dòng", metrics[0])}${money ? meter("Tiền", money) : ""}</div>`;
+  return `<div class="meters" title="Vạch giữa là ngưỡng ${esc(limitOf(i))}%">${meter("Số dòng", metrics[0], i)}${money ? meter("Tiền", money, i) : ""}${tag}</div>`;
 }
 
 function tableLabel(text) {
@@ -520,7 +530,7 @@ function rowHtml(row, i) {
     <td class="tables">${sideLines(row.old_table, row.new_table, "chưa nhập", tableLabel)}</td>
     <td class="parts">${sideLines(row.old_partition, row.new_partition, "không có", partitionLabel)}</td>
     <td class="num">${counts}</td>
-    <td>${meters(metrics)}</td>
+    <td>${meters(metrics, i)}</td>
     <td>${pill(i)}</td>
     <td><div class="row-actions"><button class="icon-btn" type="button" title="Chạy riêng bảng này" aria-label="Chạy riêng dòng ${i + 1}" data-run="${i}"${locked || (config && config.error) ? " disabled" : ""}>${ICONS.play}</button><button class="icon-btn" type="button" title="Sửa" aria-label="Sửa dòng ${i + 1}" data-edit="${i}"${locked}>${ICONS.edit}</button><button class="icon-btn danger" type="button" title="Xóa" aria-label="Xóa dòng ${i + 1}" data-remove="${i}"${locked}>${ICONS.trash}</button></div></td>
   </tr>${open ? detailHtml(i, result, config) : ""}`;
@@ -760,6 +770,7 @@ function exportResults() {
     "bang_lakehouse",
     "partition_datalake",
     "partition_lakehouse",
+    "nguong_phan_tram",
     "chi_so",
     "gia_tri_datalake",
     "gia_tri_lakehouse",
@@ -776,6 +787,7 @@ function exportResults() {
       rows[i].new_table,
       rows[i].old_partition,
       rows[i].new_partition,
+      limitOf(i),
     ];
     if (!r) {
       lines.push([...base, "", "", "", "", "", "", "Chưa chạy", ""]);
@@ -1082,7 +1094,7 @@ $("threshold").addEventListener("input", () => {
 });
 addEventListener("hashchange", showView);
 
-$("date").value = yesterday();
+$("date").value = today();
 showView();
 render();
 restore().then(() => {

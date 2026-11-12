@@ -14,8 +14,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from datetime import date, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import reconcile  # noqa: E402
@@ -47,7 +46,7 @@ class QueryFailed(Exception):
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Đối soát Datalake - Lakehouse qua Spark Thrift.")
-    p.add_argument("--date", default="", help="Ngày đối soát YYYY-MM-DD, để trống là hôm qua.")
+    p.add_argument("--date", default="", help="Ngày đối soát YYYY-MM-DD (ngày N của biến), để trống là hôm nay.")
     p.add_argument("--rows", required=True, help="File danh sách bảng (cùng định dạng với tool).")
     p.add_argument("--out-dir", required=True, help="Thư mục ghi file kết quả.")
     p.add_argument("--threshold", default="0", help="Ngưỡng % chênh lệch cho phép.")
@@ -63,13 +62,11 @@ def parse_args(argv):
 
 
 def build_config(args):
-    run_date = args.date.strip() or (date.today() - timedelta(days=1)).isoformat()
-    try:
-        threshold = Decimal(args.threshold.strip())
-    except InvalidOperation:
-        raise ValueError(f"Ngưỡng chênh lệch không hợp lệ: {args.threshold}") from None
-    if not threshold.is_finite() or threshold < 0:
-        raise ValueError("Ngưỡng chênh lệch phải là số không âm.")
+    # Ngay doi soat la ngay N cua bien: hom nay thi ${YYYYMMDD:DD-1} ra hom qua.
+    run_date = args.date.strip() or date.today().isoformat()
+    threshold = reconcile.parse_threshold(args.threshold)
+    if threshold is None:
+        raise ValueError("Chưa nhập ngưỡng chênh lệch chung.")
     if args.timeout_minutes < 1 or args.retries < 0:
         raise ValueError("--timeout-minutes phải >= 1 và --retries phải >= 0.")
 
@@ -155,7 +152,9 @@ def settle(item, sides, threshold):
     if any(o[0] == "cancelled" for o in sides.values()):
         return {"state": "cancelled", "error": "", "verdict": "", "metrics": []}
     try:
-        metrics = reconcile.compare(item["metrics"], sides["old"][1], sides["new"][1], threshold)
+        metrics = reconcile.compare(
+            item["metrics"], sides["old"][1], sides["new"][1], reconcile.row_threshold(item, threshold)
+        )
     except ValueError as exc:
         return {"state": "error", "error": str(exc), "verdict": "", "metrics": []}
     return {"state": "done", "error": "", "verdict": reconcile.verdict(metrics), "metrics": metrics}

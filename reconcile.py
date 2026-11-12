@@ -16,14 +16,16 @@ FIELDS = (
     "new_sum_columns",
     "old_sql",
     "new_sql",
+    # Nguong lech rieng cua bang (%), de trong thi dung nguong chung.
+    "threshold",
 )
 REQUIRED_HEADERS = ("old_table", "new_table")
 
 TEMPLATE_CSV = (
     ",".join(FIELDS) + "\n"
-    "old_db.giao_dich,new_db.giao_dich,partition=${YYYYMMDD:DD-1},partition=${YYYYMMDD:DD-1},so_tien|phi,amount|fee\n"
-    "old_db.cuoc,new_db.cuoc,mon=${YYMM:DD-1} AND pay_type=2,mon=${YYYYMM:DD-1} AND pay_type=2,tien_cuoc,\n"
-    "old_db.tai_khoan,new_db.tai_khoan_v2,,,so_du,\n"
+    "old_db.giao_dich,new_db.giao_dich,partition=${YYYYMMDD:DD-1},partition=${YYYYMMDD:DD-1},so_tien|phi,amount|fee,,,0.5\n"
+    "old_db.cuoc,new_db.cuoc,mon=${YYMM:DD-1} AND pay_type=2,mon=${YYYYMM:DD-1} AND pay_type=2,tien_cuoc,,,,\n"
+    "old_db.tai_khoan,new_db.tai_khoan_v2,,,so_du,,,,\n"
 )
 
 TABLE_RE = re.compile(r"^[\w.`\-]+$")
@@ -37,8 +39,8 @@ LEFTOVER_TOKEN_RE = re.compile(r"\{[^}]*\}")
 COLUMN_NAME_RE = re.compile(r"^\s*(?:(?:\w+|`[^`]+`)\.)*(\w+|`[^`]+`)\s*$")
 SELECT_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 
-# Bien thoi gian theo Bien.txt, viet dang ${YYYYMMDD:DD-1}. Moc tinh (ngay N) = ngay doi soat + 1, gio hien tai,
-# nen mac dinh (doi soat hom qua) thi N la luc dang chay va ${YYYYMMDD:DD-1} chinh la ngay doi soat.
+# Bien thoi gian theo Bien.txt, viet dang ${YYYYMMDD:DD-1}. Moc tinh (ngay N) = ngay doi soat, gio hien tai:
+# chon ngay 20261101 thi ${YYYYMMDD:DD-1} ra 20261031.
 VARIABLE_RE = re.compile(r"\$\{([^}]*)\}")
 JAVA_FORMAT_RE = re.compile(r"yyyy|yy|MM|M|dd|HH|mm|ss")
 # File canh exe (nguoi dung tu them bien) duoc uu tien hon ban dong goi kem.
@@ -146,10 +148,30 @@ def eval_variable(name, base):
 
 
 def base_time(date, now=None):
-    """Ngay N de tinh bien: ngay doi soat + 1, giu gio hien tai."""
+    """Ngay N de tinh bien: chinh ngay doi soat, giu gio hien tai."""
     now = now or datetime.now()
     parsed = datetime.strptime(date, "%Y-%m-%d")
-    return datetime.combine(parsed.date() + timedelta(days=1), now.time().replace(microsecond=0))
+    return datetime.combine(parsed.date(), now.time().replace(microsecond=0))
+
+
+def parse_threshold(value, name="Ngưỡng chênh lệch"):
+    """Nguong % lech: so khong am. Chuoi rong tra ve None."""
+    text = str(value if value is not None else "").strip().rstrip("%").strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        raise ValueError(f"{name} không hợp lệ: {value}") from None
+    if not number.is_finite() or number < 0:
+        raise ValueError(f"{name} phải là số không âm: {value}")
+    return number
+
+
+def row_threshold(item, default):
+    """Nguong ap cho mot bang da prepare: nguong rieng neu co, khong thi nguong chung."""
+    own = (item or {}).get("threshold")
+    return Decimal(own) if own else default
 
 
 def prepare_row(row, date="", now=None):
@@ -167,6 +189,7 @@ def prepare_row(row, date="", now=None):
             )
         for col in old_cols + new_cols:
             _check_fragment(col, "Cột tiền")
+        own_threshold = parse_threshold(row.get("threshold"), "Ngưỡng lệch riêng")
 
         sqls, templates = {}, {}
         for side, cols, name in (("old", old_cols, "Datalake"), ("new", new_cols, "Lakehouse")):
@@ -181,7 +204,10 @@ def prepare_row(row, date="", now=None):
             else:
                 sqls[side] = _build_sql(table, partition, cols, date, name, now)
     except ValueError as exc:
-        return {"error": str(exc), "old_sql": "", "new_sql": "", "old_template": "", "new_template": "", "metrics": []}
+        return {
+            "error": str(exc), "old_sql": "", "new_sql": "", "old_template": "", "new_template": "",
+            "metrics": [], "threshold": "",
+        }
 
     metrics = [{"label": "Số dòng", "kind": "count"}]
     for old_col, new_col in zip(old_cols, new_cols):
@@ -194,6 +220,7 @@ def prepare_row(row, date="", now=None):
         "old_template": templates["old"],
         "new_template": templates["new"],
         "metrics": metrics,
+        "threshold": "" if own_threshold is None else str(own_threshold),
     }
 
 

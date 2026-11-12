@@ -215,6 +215,7 @@ th.num { font-family: var(--font); }
 .meter-row { display: grid; grid-template-columns: 54px minmax(0, 1fr) 58px; white-space: nowrap; align-items: center; gap: 8px; font-size: 12px; line-height: 16px; color: var(--muted); }
 .meter-row em { font-style: normal; font-weight: 500; text-align: right; color: var(--text); }
 .meter-row.over em { color: var(--brand-dark); font-weight: 600; }
+.own-limit { display: block; font-size: 11px; line-height: 14px; color: var(--muted); }
 .meter { position: relative; height: 6px; overflow: hidden; background: linear-gradient(90deg, #e3f6ea 50%, var(--raised) 50%); border-radius: 3px; }
 .meter i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ok); border-radius: 3px; }
 .meter-row.over .meter i { background: var(--brand); }
