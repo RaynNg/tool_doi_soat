@@ -569,6 +569,7 @@ function render() {
   $("stop").hidden = !isRunning();
   $("export").disabled = !job || isRunning();
   $("add").disabled = isRunning();
+  $("clear-all").disabled = isRunning() || rows.length === 0;
   $("csv").disabled = isRunning();
   $("date").disabled = isRunning();
   $("threshold").disabled = isRunning();
@@ -1023,6 +1024,13 @@ Object.keys(SIDES).forEach((side) => {
   );
 });
 $("add").addEventListener("click", () => openEditor(null));
+$("clear-all").addEventListener("click", () => {
+  if (!rows.length || isRunning()) return;
+  if (!confirm(`Xóa tất cả ${rows.length} bảng khỏi danh sách?`)) return;
+  rows = [];
+  prepared = [];
+  rowsChanged();
+});
 $("export").addEventListener("click", exportResults);
 $("csv").addEventListener("change", (event) => {
   const file = event.target.files[0];

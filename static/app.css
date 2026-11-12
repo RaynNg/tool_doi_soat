@@ -122,6 +122,8 @@ a:focus-visible, button:focus-visible, label.btn:focus-visible { outline: 2px so
 .btn.dark:hover { background: var(--navy-soft); border-color: var(--navy-soft); }
 .btn.red { background: var(--brand); border-color: var(--brand); }
 .btn.red:hover { background: var(--brand-dark); border-color: var(--brand-dark); }
+.btn.danger:not(:disabled) { color: var(--brand-dark); }
+.btn.danger:hover:not(:disabled) { background: var(--brand-pale); border-color: var(--brand); }
 .btn.dark:disabled { color: var(--muted); background: var(--control); border-color: var(--control); }
 .link { white-space: nowrap; color: var(--text); font-weight: 500; text-underline-offset: 3px; }
 
