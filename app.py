@@ -3,6 +3,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import sys
 import threading
 import uuid
@@ -17,6 +18,7 @@ from TCLIService.ttypes import TOperationState
 from thrift.transport import TSocket
 from thrift.transport.TTransport import TTransportException
 
+import db
 import reconcile
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -25,7 +27,9 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 # Bien.txt canh exe (nguoi dung tu them bien) uu tien hon ban dong goi trong exe.
 reconcile.VARIABLE_FILES.insert(0, os.path.join(DATA_DIR, "Bien.txt"))
+# Ban cu luu danh sach o CSV: lan dau mo ban moi se tu chuyen vao DB, file CSV giu nguyen khong dung nua.
 ROWS_FILE = "danh_sach_bang.csv"
+DB_FILE = "doi_soat.db"
 SETTINGS_FILE = "cau_hinh.json"
 SIDES = {"old": "Datalake", "new": "Lakehouse"}
 # Mat khau luu thang trong cau_hinh.json: VDI rieng tu, nguoi dung khong muon nhap lai moi lan mo tool.
@@ -55,6 +59,26 @@ app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 jobs = {}
 jobs_lock = threading.Lock()
 state_lock = threading.Lock()
+store_lock = threading.Lock()
+store = None
+# Loi chuyen CSV cu sang DB: bao len giao dien khi mo tool.
+migrate_problem = ""
+
+
+def get_store():
+    global store, migrate_problem
+    with store_lock:
+        if store is None:
+            opened = db.Store(os.path.join(DATA_DIR, DB_FILE))
+            try:
+                with open(os.path.join(DATA_DIR, ROWS_FILE), "rb") as fh:
+                    opened.migrate_csv(reconcile.parse_csv(fh.read(), allow_empty=True))
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError) as exc:
+                migrate_problem = f"Không chuyển được {ROWS_FILE} cũ vào DB: {exc}"
+            store = opened
+        return store
 
 
 class QueryCancelled(Exception):
@@ -157,6 +181,10 @@ class Job:
         self.cancel = threading.Event()
         self.lock = threading.Lock()
         self.state = "running"
+        # Gan sau khi tao luot chay trong DB; ghi log loi thi bao len giao dien, khong lam hong luot chay.
+        self.store = None
+        self.run_id = None
+        self.log_error = ""
         self.remaining = 0
         self.rows = []
         for index, item in enumerate(prepared):
@@ -189,6 +217,7 @@ class Job:
             row["state"] = "running"
             # Hai phia cua mot bang dung chung mot thoi diem de bien gio/phut giong nhau.
             now = row.setdefault("now", datetime.now())
+        started = datetime.now()
         try:
             sql = row["prepared"][f"{side}_sql"]
             if self.raw_rows is not None:
@@ -203,6 +232,8 @@ class Job:
             outcome = ("cancelled", None)
         except Exception as exc:
             outcome = ("error", error_text(exc))
+        with self.lock:
+            row.setdefault("times", {})[side] = (started, datetime.now())
         self.finish_side(index, side, outcome)
 
     def finish_side(self, index, side, outcome):
@@ -211,10 +242,12 @@ class Job:
             row["sides"][side] = outcome
             if len(row["sides"]) == 2:
                 self.settle(row)
+                self.log_row(index)
             self.remaining -= 1
             finished = not self.remaining
             if finished:
                 self.state = "cancelled" if self.cancel.is_set() else "done"
+                self.log_finish()
         if finished and self.sql_path:
             # Ghi lai file cau query theo dung gia tri bien da chay.
             try:
@@ -240,6 +273,56 @@ class Job:
             except ValueError as exc:
                 row.update(state="error", error=str(exc))
 
+    def log_row(self, index):
+        """Ghi ket qua bang vao DB ngay khi xong, tat tool giua chung van con log. Goi khi dang giu self.lock."""
+        if self.store is None or self.run_id is None:
+            return
+        row = self.rows[index]
+        item = row["prepared"]
+        raw = self.raw_rows[index] if self.raw_rows is not None else {}
+        side_errors = {s: o[1] for s, o in row["sides"].items() if o[0] == "error"}
+        times = row.get("times", {})
+        starts = [t[0] for t in times.values()]
+
+        def took(side):
+            if side not in times:
+                return None
+            return int((times[side][1] - times[side][0]).total_seconds() * 1000)
+
+        if item["error"]:
+            threshold = str(raw.get("threshold") or self.threshold)
+        else:
+            threshold = str(reconcile.row_threshold(item, self.threshold))
+        done = row["state"] == "done"
+        result = {
+            "bang_id": db.as_id(raw.get("id")),
+            **{f: str(raw.get(f) or "") for f in ("old_table", "new_table", "old_partition", "new_partition")},
+            "nguong_ap_dung": threshold,
+            "sql_datalake": item["old_sql"],
+            "sql_lakehouse": item["new_sql"],
+            "trang_thai": "success" if done else "cancelled" if row["state"] == "cancelled" else "error",
+            "ket_luan": row["verdict"] if done else "",
+            "loi": row["error"],
+            "loi_datalake": side_errors.get("old", ""),
+            "loi_lakehouse": side_errors.get("new", ""),
+            "bat_dau_luc": db.now_text(min(starts)) if starts else None,
+            "ket_thuc_luc": db.now_text(),
+            "thoi_gian_datalake_ms": took("old"),
+            "thoi_gian_lakehouse_ms": took("new"),
+        }
+        try:
+            self.store.add_result(self.run_id, result, row["metrics"] if done else [])
+        except sqlite3.Error as exc:
+            self.log_error = f"Chưa ghi được lịch sử vào {DB_FILE}: {exc}"
+
+    def log_finish(self):
+        if self.store is None or self.run_id is None:
+            return
+        try:
+            self.store.finish_run(self.run_id, self.state)
+        except sqlite3.Error as exc:
+            self.log_error = f"Chưa ghi được lịch sử vào {DB_FILE}: {exc}"
+
     def side_progress(self, side):
         # Tien do rieng tung he thong de thay ben nao cham/treo/loi; dong loi cau hinh khong chay nen khong tinh.
         runnable = [row for row in self.rows if row["state"] != "skipped" and not row["prepared"]["error"]]
@@ -254,7 +337,9 @@ class Job:
         with self.lock:
             return {
                 "id": self.id,
+                "run_id": self.run_id,
                 "state": self.state,
+                "log_error": self.log_error,
                 "progress": {side: self.side_progress(side) for side in SIDES},
                 "rows": [
                     {k: row[k] for k in ("state", "error", "verdict", "metrics")}
@@ -311,14 +396,13 @@ def write_sql_file(prepared, date):
 
 def read_state():
     rows, settings, problems = [], {}, []
-    rows_path = os.path.join(DATA_DIR, ROWS_FILE)
+    db_path = os.path.join(DATA_DIR, DB_FILE)
     try:
-        with open(rows_path, "rb") as fh:
-            rows = reconcile.parse_csv(fh.read(), allow_empty=True)
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError) as exc:
-        problems.append(f"Không đọc được {ROWS_FILE}: {exc}")
+        rows = get_store().list_tables()
+    except sqlite3.Error as exc:
+        problems.append(f"Không mở được {DB_FILE}: {exc}")
+    if migrate_problem:
+        problems.append(migrate_problem)
     try:
         with open(os.path.join(DATA_DIR, SETTINGS_FILE), encoding="utf-8") as fh:
             settings = json.load(fh)
@@ -326,7 +410,7 @@ def read_state():
         pass
     except (OSError, ValueError) as exc:
         problems.append(f"Không đọc được {SETTINGS_FILE}: {exc}")
-    return {"rows": rows, "settings": settings, "path": rows_path, "error": " ".join(problems)}
+    return {"rows": rows, "settings": settings, "path": db_path, "error": " ".join(problems)}
 
 
 @app.errorhandler(ValueError)
@@ -343,19 +427,27 @@ def get_state():
 @app.post("/api/state")
 def save_state():
     data = request.get_json()
-    rows = [{f: str(r.get(f) or "") for f in reconcile.FIELDS} for r in data.get("rows", [])]
+    rows = []
+    for r in data.get("rows", []):
+        row = {f: str(r.get(f) or "") for f in reconcile.FIELDS}
+        row["id"] = r.get("id")
+        row["nguon"] = str(r.get("nguon") or "")
+        rows.append(row)
     incoming = data.get("settings") or {}
     settings = {k: str(incoming.get(k) or "") for k in SETTING_KEYS}
-    try:
-        with state_lock:
-            write_if_changed(os.path.join(DATA_DIR, ROWS_FILE), reconcile.to_csv(rows))
+    with state_lock:
+        try:
+            ids = get_store().sync_tables(rows)
+        except sqlite3.Error as exc:
+            return jsonify(error=f"Chưa lưu được danh sách vào {DB_FILE}: {exc}"), 500
+        try:
             write_if_changed(
                 os.path.join(DATA_DIR, SETTINGS_FILE),
                 json.dumps(settings, ensure_ascii=False, indent=2).encode("utf-8"),
             )
-    except OSError as exc:
-        return jsonify(error=f"Chưa lưu được danh sách, hãy đóng file nếu đang mở bằng Excel: {exc}"), 500
-    return jsonify(ok=True)
+        except OSError as exc:
+            return jsonify(error=f"Chưa lưu được cấu hình: {exc}", ids=ids), 500
+    return jsonify(ok=True, ids=ids)
 
 
 @app.get("/")
@@ -377,7 +469,11 @@ def parse_csv():
     upload = request.files.get("file")
     if upload is None:
         raise ValueError("Chưa chọn file CSV.")
-    return jsonify(rows=reconcile.parse_csv(upload.read()))
+    rows = reconcile.parse_csv(upload.read())
+    # Ghi nguon de lich su biet bang duoc them tu file nao.
+    for row in rows:
+        row["nguon"] = f"csv:{upload.filename or ''}"
+    return jsonify(rows=rows)
 
 
 @app.post("/api/preview")
@@ -446,8 +542,21 @@ def run():
         except OSError as exc:
             return jsonify(error=f"Chưa ghi được file câu query: {exc}"), 500
         job.sql_path = sql_path
+        try:
+            job.store = get_store()
+            job.run_id = job.store.start_run(date, threshold, parallel, cfgs, len(picked), sql_path)
+        except sqlite3.Error as exc:
+            return jsonify(error=f"Chưa ghi được lượt chạy vào {DB_FILE}: {exc}"), 500
         jobs.clear()
         jobs[job.id] = job
+
+    # Bang sai cau hinh khong chay query nhung van ghi log loi de biet.
+    with job.lock:
+        for index in picked:
+            if job.rows[index]["state"] == "error":
+                job.log_row(index)
+        if not job.remaining:
+            job.log_finish()
 
     pool = ThreadPoolExecutor(max_workers=parallel)
     for index, row in enumerate(job.rows):
@@ -456,6 +565,38 @@ def run():
             pool.submit(job.run_side, index, "new")
     pool.shutdown(wait=False)
     return jsonify(id=job.id, sql_file=sql_path)
+
+
+def optional_int(name):
+    value = request.args.get(name)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"Tham số {name} không hợp lệ.") from None
+
+
+@app.get("/api/history/runs")
+def history_runs():
+    return jsonify(runs=get_store().list_runs())
+
+
+@app.get("/api/history/results")
+def history_results():
+    return jsonify(
+        results=get_store().list_results(
+            run_id=optional_int("run"),
+            table_id=optional_int("table"),
+            term=(request.args.get("q") or "").strip(),
+            status=request.args.get("status") or "",
+        )
+    )
+
+
+@app.errorhandler(sqlite3.Error)
+def handle_db_error(exc):
+    return jsonify(error=f"Lỗi đọc/ghi {DB_FILE}: {exc}"), 500
 
 
 def find_job(job_id):
@@ -494,6 +635,11 @@ def find_free_port():
 
 def main():
     port = find_free_port()
+    # Mo DB som: chuyen CSV cu va danh dau cac luot bi tat giua chung truoc khi giao dien goi vao.
+    try:
+        get_store()
+    except sqlite3.Error as exc:
+        print(f"Khong mo duoc {DB_FILE}: {exc}")
     url = f"http://127.0.0.1:{port}"
     # Khong dau: console Windows cu co the khong in duoc tieng Viet va lam exe dung ngay.
     print(f"Cong cu doi soat dang chay tai {url}")

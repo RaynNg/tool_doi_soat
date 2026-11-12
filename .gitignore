@@ -9,5 +9,8 @@ dist_moi/
 # Du lieu noi bo do tool tu luu canh file chay
 danh_sach_bang.csv
 cau_hinh.json
+doi_soat.db
+doi_soat.db-wal
+doi_soat.db-shm
 
 Screenshot*.png

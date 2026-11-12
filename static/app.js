@@ -72,8 +72,11 @@ async function api(path, options) {
   } catch (err) {
     throw new Error(`Máy chủ trả về lỗi ${res.status}.`);
   }
-  if (!res.ok)
-    throw new Error(body.error || `Máy chủ trả về lỗi ${res.status}.`);
+  if (!res.ok) {
+    const err = new Error(body.error || `Máy chủ trả về lỗi ${res.status}.`);
+    err.body = body;
+    throw err;
+  }
   return body;
 }
 
@@ -89,16 +92,30 @@ function setSaved(text, bad) {
   $("saved").classList.toggle("bad", Boolean(bad));
 }
 
-async function save() {
+// Luu lan luot tung lan: dong moi chi co id sau khi server tra ve, luu chong nhau se them trung bang.
+let saveChain = Promise.resolve();
+function save() {
   clearTimeout(saveTimer);
+  saveChain = saveChain.then(saveNow);
+  return saveChain;
+}
+
+async function saveNow() {
   const settings = {};
   SETTING_FIELDS.forEach((f) => (settings[f] = $(f).value));
+  // Giu tham chieu dong da gui de gan id dung dong, ke ca khi danh sach doi trong luc cho.
+  const posted = rows.slice();
+  const applyIds = (ids) =>
+    (ids || []).forEach((id, k) => (posted[k].id = id));
   try {
-    await postJson("/api/state", { rows, settings });
+    const body = await postJson("/api/state", { rows: posted, settings });
+    applyIds(body.ids);
     setSaved(`Tự động lưu tại ${savedPath}`);
   } catch (err) {
+    if (err.body) applyIds(err.body.ids);
     setSaved(err.message, true);
   }
+  render();
 }
 
 function saveSoon() {
@@ -247,6 +264,10 @@ const ICONS = {
     '<path d="M2.8 4.5h10.4M6.2 4.5V3h3.6v1.5M4.2 4.5l.6 8.5h6.4l.6-8.5M6.8 7v3.5M9.2 7v3.5"/>',
   ),
   play: svgIcon(16, '<path d="M5 3.3v9.4L12.4 8z"/>'),
+  history: svgIcon(
+    16,
+    '<path d="M2.8 8a5.2 5.2 0 1 0 1.5-3.7M2.8 2.8v2.3h2.3M8 5.2V8l2 1.4"/>',
+  ),
 };
 
 const highlightSql = (sql) =>
@@ -527,12 +548,12 @@ function rowHtml(row, i) {
   return `<tr class="row is-${statusOf(i)}${open ? " open" : ""}" id="row-${i}">
     <td><input class="pick" type="checkbox" data-pick="${i}" aria-label="Chọn dòng ${i + 1}"${selected.has(i) ? " checked" : ""}${locked}></td>
     <td><button class="toggle" type="button" data-toggle="${i}" aria-expanded="${open}" aria-label="Xem chi tiết dòng ${i + 1}">${CHEVRON}</button></td>
-    <td class="tables">${sideLines(row.old_table, row.new_table, "chưa nhập", tableLabel)}</td>
+    <td class="tables">${row.id ? `<span class="row-id num" title="Id bảng trong lịch sử">#${row.id}</span>` : ""}${sideLines(row.old_table, row.new_table, "chưa nhập", tableLabel)}</td>
     <td class="parts">${sideLines(row.old_partition, row.new_partition, "không có", partitionLabel)}</td>
     <td class="num">${counts}</td>
     <td>${meters(metrics, i)}</td>
     <td>${pill(i)}</td>
-    <td><div class="row-actions"><button class="icon-btn" type="button" title="Chạy riêng bảng này" aria-label="Chạy riêng dòng ${i + 1}" data-run="${i}"${locked || (config && config.error) ? " disabled" : ""}>${ICONS.play}</button><button class="icon-btn" type="button" title="Sửa" aria-label="Sửa dòng ${i + 1}" data-edit="${i}"${locked}>${ICONS.edit}</button><button class="icon-btn danger" type="button" title="Xóa" aria-label="Xóa dòng ${i + 1}" data-remove="${i}"${locked}>${ICONS.trash}</button></div></td>
+    <td><div class="row-actions"><button class="icon-btn" type="button" title="Chạy riêng bảng này" aria-label="Chạy riêng dòng ${i + 1}" data-run="${i}"${locked || (config && config.error) ? " disabled" : ""}>${ICONS.play}</button><button class="icon-btn" type="button" title="Xem lịch sử bảng này" aria-label="Lịch sử dòng ${i + 1}" data-history="${i}">${ICONS.history}</button><button class="icon-btn" type="button" title="Sửa" aria-label="Sửa dòng ${i + 1}" data-edit="${i}"${locked}>${ICONS.edit}</button><button class="icon-btn danger" type="button" title="Xóa" aria-label="Xóa dòng ${i + 1}" data-remove="${i}"${locked}>${ICONS.trash}</button></div></td>
   </tr>${open ? detailHtml(i, result, config) : ""}`;
 }
 
@@ -609,9 +630,13 @@ async function poll(id) {
   );
   const changed = JSON.stringify(next) !== JSON.stringify(job);
   job = next;
+  if (next.log_error) setSaved(next.log_error, true);
   if (changed) render();
   if (isRunning()) setTimeout(() => poll(id), POLL_MS);
-  else clearInterval(clockTimer);
+  else {
+    clearInterval(clockTimer);
+    if (location.hash === "#lich-su") loadHistory();
+  }
 }
 
 // indices = null: chay tat ca; mang chi so: chay rieng cac dong do, giu ket qua cac dong khac.
@@ -656,6 +681,8 @@ async function runAll(indices = null) {
     filter = "all";
   }
   $("run").disabled = true;
+  // Moi bang phai co id trong DB truoc khi chay de lich su gan dung bang.
+  await save();
   try {
     const body = await postJson("/api/run", {
       connections: { old: connection("old"), new: connection("new") },
@@ -898,13 +925,247 @@ function openEditor(index) {
   refreshEditor();
 }
 
+const VIEWS = { "#ket-noi": "conn", "#lich-su": "hist" };
+
 function showView() {
-  const onConn = location.hash === "#ket-noi";
-  $("view-main").hidden = onConn;
-  $("view-conn").hidden = !onConn;
-  $("nav-main").classList.toggle("active", !onConn);
-  $("nav-conn").classList.toggle("active", onConn);
+  const view = VIEWS[location.hash] || "main";
+  ["main", "conn", "hist"].forEach((name) => {
+    $(`view-${name}`).hidden = name !== view;
+    $(`nav-${name}`).classList.toggle("active", name === view);
+  });
+  if (view === "hist") loadHistory();
 }
+
+// ---------- Lich su (doc tu SQLite) ----------
+
+const HISTORY_LIMIT = 500;
+const hist = {
+  run: null,
+  table: null,
+  tableLabel: "",
+  expanded: new Set(),
+  results: [],
+  seq: 0,
+};
+let histTimer = null;
+
+const RUN_STATE_TEXT = {
+  running: "Đang chạy",
+  done: "Xong",
+  cancelled: "Đã dừng",
+  interrupted: "Bị ngắt (tắt tool)",
+};
+
+function dateText(text) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}:\d{2}:\d{2}))?$/.exec(
+    text || "",
+  );
+  if (!m) return text || "";
+  return `${m[3]}/${m[2]}/${m[1]}${m[4] ? ` ${m[4]}` : ""}`;
+}
+
+function spanText(start, end) {
+  if (!start || !end) return "";
+  const ms =
+    new Date(end.replace(" ", "T")) - new Date(start.replace(" ", "T"));
+  return Number.isFinite(ms) ? formatClock(ms) : "";
+}
+
+function msText(ms) {
+  if (ms === null || ms === undefined) return '<span class="dash">—</span>';
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
+function runPill(state) {
+  if (state === "success")
+    return `<span class="pill ok">${ICONS.check}Thành công</span>`;
+  if (state === "error")
+    return `<span class="pill error">${ICONS.alert}Lỗi</span>`;
+  return '<span class="pill neutral">Đã dừng</span>';
+}
+
+function verdictPill(r) {
+  if (r.trang_thai !== "success") return '<span class="dash">—</span>';
+  if (r.ket_luan === "lech")
+    return `<span class="pill lech">${ICONS.cross}Lệch</span>`;
+  if (r.ket_luan === "trong")
+    return `<span class="pill trong">${ICONS.alert}0 dòng</span>`;
+  return `<span class="pill ok">${ICONS.check}Khớp</span>`;
+}
+
+const countCell = (n, tone) =>
+  `<td class="num${n && tone ? ` ${tone}` : ""}">${n || '<span class="dash">0</span>'}</td>`;
+const orDash = (text) => esc(text) || '<span class="dash">—</span>';
+
+function renderRuns(runs) {
+  $("hist-runs").innerHTML = runs
+    .map(
+      (r) => `<tr class="run-row${hist.run === r.id ? " picked" : ""}" data-run-id="${r.id}" tabindex="0" title="Xem kết quả từng bảng của lượt này">
+      <td class="num">#${r.id}</td>
+      <td><span class="num">${esc(dateText(r.bat_dau_luc))}</span></td>
+      <td><span class="num">${orDash(dateText(r.ngay_doi_soat))}</span></td>
+      <td class="num">${orDash(spanText(r.bat_dau_luc, r.ket_thuc_luc))}</td>
+      <td><span class="run-state ${esc(r.trang_thai)}">${esc(RUN_STATE_TEXT[r.trang_thai] || r.trang_thai)}</span></td>
+      <td class="num">${r.tong_bang}</td>
+      ${countCell(r.so_ok, "good")}${countCell(r.so_lech, "bad")}${countCell(r.so_trong, "warn")}${countCell(r.so_loi, "bad")}${countCell(r.so_dung)}
+    </tr>`,
+    )
+    .join("");
+  $("hist-runs-empty").hidden = runs.length > 0;
+}
+
+function histDetail(r) {
+  const metrics = r.metrics.length
+    ? `<table class="metrics"><thead><tr><th>Chỉ số</th><th class="num">Datalake</th><th class="num">Lakehouse</th><th class="num">Lakehouse − Datalake</th><th class="num">Lệch</th></tr></thead><tbody>${r.metrics
+        .map(
+          (m) =>
+            `<tr><td class="label">${esc(m.label)}</td><td class="num">${numCell(m.old)}</td><td class="num">${numCell(m.new)}</td><td class="num">${signedCell(m.diff)}</td><td class="num${m.ok ? "" : " over"}">${pctText(m)}</td></tr>`,
+        )
+        .join("")}</tbody></table>`
+    : "";
+  const error = r.loi ? `<p class="error-text">${esc(r.loi)}</p>` : "";
+  const parts = sideLines(
+    r.old_partition,
+    r.new_partition,
+    "không có",
+    partitionLabel,
+  );
+  const sql = [
+    ["Datalake", r.sql_datalake],
+    ["Lakehouse", r.sql_lakehouse],
+  ]
+    .filter(([, text]) => text)
+    .map(
+      ([name, text]) =>
+        `<div class="sql-block"><h3>Query ${name} đã chạy</h3><pre>${highlightSql(text)}</pre></div>`,
+    )
+    .join("");
+  return `<tr class="hist-detail"><td></td><td colspan="9"><div class="detail-grid">${error}${metrics}<div class="parts"><h3>Partition</h3>${parts}</div>${sql ? `<div class="sql-stack">${sql}</div>` : ""}</div></td></tr>`;
+}
+
+function renderResults() {
+  $("hist-results").innerHTML = hist.results
+    .map((r) => {
+      const open = hist.expanded.has(r.id);
+      const tableId = r.bang_id
+        ? `<button class="link-btn num" type="button" data-hist-table="${r.bang_id}" title="Chỉ xem bảng này">#${r.bang_id}</button>`
+        : '<span class="dash">—</span>';
+      const sideCell = (error, ms) =>
+        `<td class="num" title="${esc(error)}">${error ? '<span class="side-err">Lỗi</span> ' : ""}${msText(ms)}</td>`;
+      return `<tr class="res-row${open ? " open" : ""}">
+        <td><button class="toggle" type="button" data-hist-open="${r.id}" aria-expanded="${open}" aria-label="Xem chi tiết">${CHEVRON}</button></td>
+        <td><span class="num">${esc(dateText(r.ket_thuc_luc || r.luot_bat_dau_luc))}</span></td>
+        <td><button class="link-btn num" type="button" data-hist-run="${r.luot_chay_id}" title="Chỉ xem lượt này">#${r.luot_chay_id}</button></td>
+        <td>${tableId}</td>
+        <td class="tables">${sideLines(r.old_table, r.new_table, "chưa nhập", tableLabel)}</td>
+        <td>${runPill(r.trang_thai)}</td>
+        <td>${verdictPill(r)}</td>
+        <td class="num">${r.nguong_ap_dung ? `${esc(r.nguong_ap_dung)}%` : ""}</td>
+        ${sideCell(r.loi_datalake, r.thoi_gian_datalake_ms)}${sideCell(r.loi_lakehouse, r.thoi_gian_lakehouse_ms)}
+      </tr>${open ? histDetail(r) : ""}`;
+    })
+    .join("");
+  $("hist-results-empty").hidden = hist.results.length > 0;
+  const chips = [];
+  if (hist.run !== null)
+    chips.push(
+      `<button class="chip" type="button" data-hist-clear="run" title="Bỏ lọc">Lượt #${hist.run} ✕</button>`,
+    );
+  if (hist.table !== null)
+    chips.push(
+      `<button class="chip" type="button" data-hist-clear="table" title="Bỏ lọc">Bảng #${hist.table}${hist.tableLabel ? ` · ${esc(hist.tableLabel)}` : ""} ✕</button>`,
+    );
+  $("hist-chips").innerHTML = chips.join("");
+}
+
+async function loadHistory() {
+  const seq = ++hist.seq;
+  const params = new URLSearchParams();
+  if (hist.run !== null) params.set("run", hist.run);
+  if (hist.table !== null) params.set("table", hist.table);
+  const term = $("hist-search").value.trim();
+  if (term) params.set("q", term);
+  if ($("hist-status").value) params.set("status", $("hist-status").value);
+  try {
+    const [runs, results] = await Promise.all([
+      api("/api/history/runs"),
+      api(`/api/history/results?${params}`),
+    ]);
+    if (seq !== hist.seq) return;
+    hist.results = results.results;
+    renderRuns(runs.runs);
+    renderResults();
+    $("hist-note").textContent =
+      hist.results.length >= HISTORY_LIMIT
+        ? `Đang hiện ${HISTORY_LIMIT} kết quả mới nhất, lọc theo bảng hoặc lượt để xem cũ hơn.`
+        : "";
+    $("hist-note").classList.remove("bad");
+  } catch (err) {
+    $("hist-note").textContent = err.message;
+    $("hist-note").classList.add("bad");
+  }
+}
+
+async function openTableHistory(i) {
+  const row = rows[i];
+  if (!row.id) await save();
+  if (!row.id) return;
+  hist.table = row.id;
+  hist.tableLabel = row.new_table || row.old_table;
+  hist.run = null;
+  hist.expanded = new Set();
+  $("hist-search").value = "";
+  $("hist-status").value = "";
+  if (location.hash === "#lich-su") loadHistory();
+  else location.hash = "lich-su";
+}
+
+$("hist-runs").addEventListener("click", (event) => {
+  const tr = event.target.closest("[data-run-id]");
+  if (!tr) return;
+  const id = Number(tr.dataset.runId);
+  hist.run = hist.run === id ? null : id;
+  hist.expanded = new Set();
+  loadHistory();
+});
+$("hist-runs").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && event.target.matches("[data-run-id]"))
+    event.target.click();
+});
+
+$("hist-results").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.dataset.histOpen !== undefined) {
+    const id = Number(button.dataset.histOpen);
+    if (hist.expanded.has(id)) hist.expanded.delete(id);
+    else hist.expanded.add(id);
+    renderResults();
+  } else if (button.dataset.histRun !== undefined) {
+    hist.run = Number(button.dataset.histRun);
+    loadHistory();
+  } else if (button.dataset.histTable !== undefined) {
+    hist.table = Number(button.dataset.histTable);
+    const r = hist.results.find((x) => x.bang_id === hist.table);
+    hist.tableLabel = r ? r.new_table || r.old_table : "";
+    loadHistory();
+  }
+});
+
+$("hist-chips").addEventListener("click", (event) => {
+  const chip = event.target.closest("[data-hist-clear]");
+  if (!chip) return;
+  hist[chip.dataset.histClear] = null;
+  if (chip.dataset.histClear === "table") hist.tableLabel = "";
+  loadHistory();
+});
+
+$("hist-search").addEventListener("input", () => {
+  clearTimeout(histTimer);
+  histTimer = setTimeout(loadHistory, 250);
+});
+$("hist-status").addEventListener("change", loadHistory);
+$("hist-reload").addEventListener("click", loadHistory);
 
 $("editor-form").addEventListener("input", () => {
   clearTimeout(previewTimer);
@@ -918,7 +1179,8 @@ $("editor-form").addEventListener("submit", async (event) => {
   if (!item || item.error) return;
   const index = editingIndex;
   if (index === null) rows.push(row);
-  else rows[index] = row;
+  // Sua tren chinh doi tuong cu de giu id (ke ca id dang cho server tra ve).
+  else Object.assign(rows[index], row);
   $("editor").close();
   rowEdited((results) =>
     index === null ? results.push(null) : (results[index] = null),
@@ -989,6 +1251,8 @@ $("rows").addEventListener("click", (event) => {
     const i = Number(button.dataset.run);
     expanded.add(i);
     runAll([i]);
+  } else if (button.dataset.history !== undefined) {
+    openTableHistory(Number(button.dataset.history));
   } else if (button.dataset.edit !== undefined) {
     openEditor(Number(button.dataset.edit));
   } else if (button.dataset.remove !== undefined) {
