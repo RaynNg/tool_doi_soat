@@ -551,15 +551,53 @@ function detailHtml(i, result, config) {
           )
           .join("")}</div>`
       : "";
-  const extra =
-    warningsHtml(result && result.warnings) +
-    causeHtml(result && result.cause) +
-    depsLine(i);
-  const left = errorText
+  const blockedChains =
+    result && result.state === "blocked"
+      ? (result.chains && result.chains.length ? result.chains : chainsFromText(result.error))
+      : null;
+  const blocked = Boolean(blockedChains);
+  // Bang bi bo qua: chi can chuoi tu bang nguon lech toi bang nay, khong liet ke bang nguon.
+  const extra = blocked
+    ? warningsHtml(result.warnings)
+    : warningsHtml(result && result.warnings) + causeHtml(result && result.cause) + depsLine(i);
+  const left = blocked
+    ? `${chainHtml(blockedChains)}${extra}`
+    : errorText
     ? `<p class="error-text">${esc(errorText)}</p>${table}${extra}`
     : (table || '<p class="dash">Chưa có kết quả, bấm Chạy đối soát.</p>') +
       extra;
   return `<tr class="detail is-${statusOf(i)}"><td colspan="8"><div class="detail-grid"><div>${left}</div>${sql}</div></td></tr>`;
+}
+
+// Bang bi bo qua: mot dong in dam "Khong doi soat ...: a → b → c". Chu dan va mui ten mau den,
+// bang dau (lech qua nguong) mau do, cac bang sau mau tim.
+const BLOCKED_PREFIX = "Không đối soát vì bảng nguồn lệch quá ngưỡng:";
+
+// Lay lai chuoi tu cau loi da luu (lich su, hoac luot chay cu chua co chains).
+function chainsFromText(text) {
+  if (!text || !text.startsWith(BLOCKED_PREFIX)) return null;
+  const chains = text
+    .slice(BLOCKED_PREFIX.length)
+    .trim()
+    .replace(/\.$/, "")
+    .split("; ")
+    .map((part) => part.split(" → ").map((x) => x.trim()).filter(Boolean))
+    .filter((c) => c.length);
+  return chains.length ? chains : null;
+}
+
+function chainHtml(chains) {
+  const lines = chains
+    .map((chain) =>
+      chain
+        .map((name, k) => {
+          const note = k === 0 ? "lệch quá ngưỡng" : k === chain.length - 1 ? "bảng này" : "bị bỏ qua theo";
+          return `<span class="chain-name ${k === 0 ? "src" : "next"}" title="${esc(note)}">${esc(name)}</span>`;
+        })
+        .join('<span class="chain-arrow"> → </span>'),
+    )
+    .join('<span class="chain-arrow">; </span>');
+  return `<p class="chain-text">${BLOCKED_PREFIX} ${lines}.</p>`;
 }
 
 function rowHtml(row, i) {
@@ -954,6 +992,58 @@ function toggleSqlEditor(side) {
   refreshEditor();
 }
 
+// ---------- Kiem tra ten bang ngay khi nhap trong hop thoai Them/Sua ----------
+
+const tableKey = (t) => String(t || "").trim().replace(/`/g, "").toLowerCase();
+const EDITOR_TABLES = {
+  old_table: { system: "old", other: "new_table", name: "Datalake", tool: "Pentaho" },
+  new_table: { system: "new", other: "old_table", name: "Lakehouse", tool: "Apache Hop" },
+};
+let editorCheckSeq = 0;
+
+// Cac dong khac trong danh sach co cung ten bang (khong tinh dong dang sua).
+function duplicateRows(field, value) {
+  const key = tableKey(value);
+  if (!key) return [];
+  return rows
+    .map((r, i) => (i !== editingIndex && tableKey(r[field]) === key ? i : -1))
+    .filter((i) => i >= 0);
+}
+
+async function checkEditorTables() {
+  const seq = ++editorCheckSeq;
+  const form = $("editor-form");
+  const results = await Promise.all(
+    Object.entries(EDITOR_TABLES).map(async ([field, info]) => {
+      const value = form.elements[field].value.trim();
+      if (!value) return [field, ""];
+      const parts = [];
+      const dups = duplicateRows(field, value);
+      if (dups.length)
+        parts.push(
+          `<span class="hint-warn">${ICONS.alert}Đã có trong danh sách đối soát: ${dups
+            .map((i) => `dòng ${i + 1}${rows[i][info.other] ? ` (${esc(rows[i][info.other])})` : ""}`)
+            .join(", ")}</span>`,
+        );
+      // Bang co trong job da quet cua he thong nay khong (Pentaho cho Datalake, Hop cho Lakehouse).
+      try {
+        const body = await postJson("/api/lineage/deps", { rows: [{ [field]: value }], system: info.system });
+        if (body.scanned)
+          parts.push(
+            body.rows[0] && body.rows[0].node
+              ? `<span class="hint-ok">${ICONS.check}Có trong job ${info.tool} đã quét${body.rows[0].node !== tableKey(value) ? ` (${esc(body.rows[0].node)})` : ""}</span>`
+              : `<span class="hint-muted">Không thấy trong job ${info.tool} đã quét</span>`,
+          );
+      } catch (err) {
+        /* khong kiem tra duoc job thi chi bao trung danh sach */
+      }
+      return [field, parts.join("")];
+    }),
+  );
+  if (seq !== editorCheckSeq) return;
+  results.forEach(([field, html]) => ($(`hint-${field}`).innerHTML = html));
+}
+
 function openEditor(index) {
   editingIndex = index;
   const form = $("editor-form");
@@ -963,8 +1053,10 @@ function openEditor(index) {
     showSqlEditor(side, Boolean(row[`${side}_sql`])),
   );
   $("editor-title").textContent = index === null ? "Thêm bảng" : "Sửa bảng";
+  Object.keys(EDITOR_TABLES).forEach((f) => ($(`hint-${f}`).innerHTML = ""));
   $("editor").showModal();
   refreshEditor();
+  checkEditorTables();
 }
 
 const VIEWS = { "#ket-noi": "conn", "#lich-su": "hist", "#phu-thuoc": "dep" };
@@ -1108,8 +1200,9 @@ function histDetail(r) {
         )
         .join("")}</tbody></table>`
     : "";
+  const histChains = r.trang_thai === "blocked" ? chainsFromText(r.loi) : null;
   const error =
-    (r.loi ? `<p class="error-text">${esc(r.loi)}</p>` : "") +
+    (histChains ? chainHtml(histChains) : r.loi ? `<p class="error-text">${esc(r.loi)}</p>` : "") +
     warningsHtml(r.canh_bao ? r.canh_bao.split("\n") : []) +
     causeHtml(parseCause(r.nghi_do));
   const parts = sideLines(
@@ -1255,7 +1348,23 @@ $("hist-search").addEventListener("input", () => {
 $("hist-status").addEventListener("change", loadHistory);
 $("hist-reload").addEventListener("click", loadHistory);
 
-// ---------- Phu thuoc giua cac bang (quet job Hop) ----------
+// ---------- Phu thuoc giua cac bang (quet job Hop cho Lakehouse, Pentaho cho Datalake) ----------
+
+const SYSTEMS = {
+  new: {
+    name: "Lakehouse", tool: "Apache Hop", exts: ".hwf/.hpl", field: "new_table",
+    home: "${PROJECT_HOME}",
+    homeEmpty: "Tự dò trong các thư mục cha của thư mục quét · bấm để chọn tay",
+  },
+  old: {
+    name: "Datalake", tool: "Pentaho", exts: ".kjb/.ktr", field: "old_table",
+    home: "Thư mục gốc cho biến đầu đường dẫn (vd ${ETL_HOME}, ${PROJECT_HOME})",
+    homeEmpty: "Tự dò từng biến trong các thư mục cha của thư mục quét · bấm để chọn tay",
+  },
+};
+// Bang nguon/dich trong danh sach cua tung dong theo Datalake (graph Pentaho); deps la Lakehouse.
+let depsOld = null;
+const curDeps = () => (dep.system === "old" ? depsOld : deps);
 
 // Bang nguon/dich trong danh sach cua tung dong, tinh tren server tu graph da quet.
 let deps = null;
@@ -1283,13 +1392,18 @@ const KIND_TEXT = {
 
 async function refreshDeps() {
   const seq = ++depsSeq;
-  try {
-    const body = await postJson("/api/lineage/deps", { rows });
-    if (seq !== depsSeq) return;
-    deps = body.scanned ? body.rows : null;
-  } catch (err) {
-    deps = null;
-  }
+  const load = async (system) => {
+    try {
+      const body = await postJson("/api/lineage/deps", { rows, system });
+      return body.scanned ? body.rows : null;
+    } catch (err) {
+      return null;
+    }
+  };
+  const [fresh, freshOld] = await Promise.all([load("new"), load("old")]);
+  if (seq !== depsSeq) return;
+  deps = fresh;
+  depsOld = freshOld;
   render();
   if (typeof renderDepKpis === "function") renderDepKpis();
   if (typeof refreshAutoFocus === "function") refreshAutoFocus();
@@ -1304,7 +1418,7 @@ function renderDepKpis() {
   $("kpi-edges-note").textContent = d ? "nguồn → đích" : "";
   $("kpi-stmts").textContent = d ? d.statements.length : "—";
   $("kpi-stmts-note").textContent = d && d.warnings.length ? `${d.warnings.length} cảnh báo khi quét` : d ? "không có cảnh báo" : "";
-  const matched = deps ? deps.filter((x) => x && x.node).length : 0;
+  const matched = curDeps() ? curDeps().filter((x) => x && x.node).length : 0;
   $("kpi-listed").textContent = d ? `${matched} / ${rows.length}` : "—";
   $("kpi-listed-note").textContent = d
     ? matched < rows.length ? `${rows.length - matched} bảng không thấy trong job` : "đều có trong job"
@@ -1340,7 +1454,7 @@ function causeHtml(cause) {
         ? `<table class="metrics cause-table"><thead><tr><th>Bảng nguồn</th><th>Cột</th><th class="num">Lệch</th><th class="num">Lakehouse − Datalake</th><th>Kết quả lấy từ</th></tr></thead><tbody>${m.entries
             .map(
               (e) =>
-                `<tr title="${esc((e.path || []).join(" → "))}"><td class="tables">${tableLabel(e.table)}</td><td>${e.column ? esc(e.column) : '<span class="dash">cả bảng</span>'}${e.label ? `<small class="muted"> · ${esc(e.label)}</small>` : ""}</td><td class="num${e.ok === false ? " over" : ""}">${pctOf(e)}</td><td class="num">${e.diff === null || e.diff === undefined ? '<span class="dash">—</span>' : signedCell(e.diff)}</td><td class="small muted">${esc([e.from, e.note].filter(Boolean).join(" · "))}</td></tr>`,
+                `<tr title="${esc((e.path || []).join(" → "))}"><td class="tables">${tableLabel(e.table)}${sysTag(e.system)}</td><td>${e.column ? esc(e.column) : '<span class="dash">cả bảng</span>'}${e.label ? `<small class="muted"> · ${esc(e.label)}</small>` : ""}</td><td class="num${e.ok === false ? " over" : ""}">${pctOf(e)}</td><td class="num">${e.diff === null || e.diff === undefined ? '<span class="dash">—</span>' : signedCell(e.diff)}</td><td class="small muted">${esc([e.from, e.note].filter(Boolean).join(" · "))}</td></tr>`,
             )
             .join("")}</tbody></table>`
         : "";
@@ -1351,7 +1465,7 @@ function causeHtml(cause) {
     ? `<details class="writers"><summary>Xem ${cause.writers.length} câu lệnh nạp ${esc(cause.table)}</summary>${cause.writers
         .map(
           (w) =>
-            `<div class="sql-block"><h3>${esc(w.kind)} · ${esc(w.file)} › ${esc(w.step)}</h3><pre>${highlightSql(w.sql)}</pre></div>`,
+            `<div class="sql-block"><h3>${sysTag(w.system)}${esc(w.kind)} · ${esc(w.file)} › ${esc(w.step)}</h3><pre>${highlightSql(w.sql)}</pre></div>`,
         )
         .join("")}</details>`
     : "";
@@ -1384,35 +1498,50 @@ function traceNode(n) {
   return `<div class="ct-node"><span class="ct-col">${name}<span class="ct-dot">.</span><code>${esc(col)}</code></span>${kindTag}${listed}${leaf}${cut}</div>${steps ? `<ul class="ct-steps">${steps}</ul>` : ""}`;
 }
 
+function sysTag(system) {
+  if (system === "both") return '<span class="sys-tag both">Cả hai</span>';
+  return SYSTEMS[system] ? `<span class="sys-tag ${system}">${SYSTEMS[system].name}</span>` : "";
+}
+
 function traceHtml(tree) {
   if (!tree) return "";
   const body = tree.from.length
     ? traceNode(tree)
     : '<p class="dash">Không tìm thấy câu lệnh nào tính ra cột này trong job đã quét (cần quét lại job nếu vừa cập nhật tool).</p>';
-  return `<details class="col-trace" open><summary>Cột <code>${esc(tree.column)}</code> của ${esc(tree.table)} được tính từ những cột nào</summary><div class="ct-tree">${body}</div></details>`;
+  return `<details class="col-trace" open><summary>${sysTag(tree.system)}Cột <code>${esc(tree.column)}</code> của ${esc(tree.table)} được tính từ những cột nào${tree.system ? ` (job ${SYSTEMS[tree.system].tool})` : ""}</summary><div class="ct-tree">${body}</div></details>`;
 }
 
 function depsLine(i) {
-  if (!deps || !deps[i]) return "";
-  const info = deps[i];
-  if (!info.node)
-    return '<p class="deps-line muted">Không thấy bảng Lakehouse này trong job Hop đã quét.</p>';
-  const names = (list) =>
-    list.length
-      ? list.map((j) => esc(tableName(j))).join(", ")
-      : '<span class="dash">không có</span>';
-  return `<p class="deps-line"><span><span class="muted">Bảng nguồn trong danh sách:</span> ${names(info.upstream)}</span><span><span class="muted">Bảng phía sau:</span> ${names(info.downstream)}</span><button class="btn small" type="button" data-dep-open="${esc(info.node)}">Xem sơ đồ</button></p>`;
+  return [["new", deps], ["old", depsOld]]
+    .filter(([, list]) => list && list[i])
+    .map(([system, list]) => {
+      const info = list[i];
+      const sys = SYSTEMS[system];
+      const tag = `<span class="sys-tag ${system}">${sys.name}</span>`;
+      if (!info.node)
+        return `<p class="deps-line muted">${tag}Không thấy bảng này trong job ${sys.tool} đã quét.</p>`;
+      const names = (idx) =>
+        idx.length
+          ? idx.map((j) => esc((rows[j] && rows[j][sys.field]) || tableName(j))).join(", ")
+          : '<span class="dash">không có</span>';
+      return `<p class="deps-line">${tag}<span><span class="muted">Bảng nguồn trong danh sách:</span> ${names(info.upstream)}</span><span><span class="muted">Bảng phía sau:</span> ${names(info.downstream)}</span><button class="btn small" type="button" data-dep-open="${esc(info.node)}" data-dep-system="${system}">Xem sơ đồ</button></p>`;
+    })
+    .join("");
 }
 
-function openDependency(node) {
+function openDependency(node, system) {
+  const switched = Boolean(system && system !== dep.system);
+  if (switched) switchSystem(system, false);
   dep.focus = node;
   dep.autoFocus = false;
   dep.edge = null;
   $("dep-search").value = node;
-  if (location.hash === "#phu-thuoc") {
+  if (location.hash !== "#phu-thuoc") location.hash = "phu-thuoc";
+  else if (switched) loadLineage(true);
+  else {
     renderGraph();
     renderDepDetail();
-  } else location.hash = "phu-thuoc";
+  }
 }
 
 const nodeKind = (n) =>
@@ -1428,7 +1557,8 @@ function nodeLabel(n) {
 }
 
 function nodeRow(n) {
-  return deps ? deps.findIndex((d) => d && d.node === n) : -1;
+  const list = curDeps();
+  return list ? list.findIndex((d) => d && d.node === n) : -1;
 }
 
 // Nut nam trong danh sach doi soat: lay trang thai cua dong do de to mau.
@@ -1440,25 +1570,35 @@ function nodeStatus(n) {
 
 // ---------- doc / quet ----------
 
+// Moi he thong nho rieng thu muc quet va thu muc goc cua bien.
 const DEP_PREFS = "doi_soat_phu_thuoc";
 function readPrefs() {
   try {
-    return JSON.parse(localStorage.getItem(DEP_PREFS) || "{}");
+    const saved = JSON.parse(localStorage.getItem(DEP_PREFS) || "{}");
+    // Ban cu chi luu mot thu muc (cua Hop).
+    if (saved.folder !== undefined && !saved.new) saved.new = { folder: saved.folder, home: saved.home };
+    return saved;
   } catch (err) {
     return {};
   }
 }
+const depPrefs = readPrefs();
 function writePrefs() {
+  depPrefs[dep.system] = { folder: dep.folder, home: dep.home };
+  depPrefs.system = dep.system;
   try {
     localStorage.setItem(
       DEP_PREFS,
-      JSON.stringify({ folder: dep.folder, home: dep.home }),
+      JSON.stringify({ system: depPrefs.system, new: depPrefs.new, old: depPrefs.old }),
     );
   } catch (err) {
     /* trinh duyet chan luu tru: bo qua */
   }
 }
-Object.assign(dep, readPrefs(), {
+dep.system = depPrefs.system === "old" ? "old" : "new";
+dep.folder = (depPrefs[dep.system] || {}).folder || "";
+dep.home = (depPrefs[dep.system] || {}).home || "";
+Object.assign(dep, {
   colIndex: new Map(),
   view: { x: 0, y: 0, k: 1 },
   viewFocus: null,
@@ -1466,6 +1606,39 @@ Object.assign(dep, readPrefs(), {
   drag: null,
   moved: false,
 });
+
+// Doi giua Lakehouse (Hop) va Datalake (Pentaho): moi he thong mot graph, thu muc va bang chon rieng.
+function switchSystem(system, reload = true) {
+  if (system === dep.system || !SYSTEMS[system]) return;
+  writePrefs();
+  dep.system = system;
+  dep.folder = (depPrefs[system] || {}).folder || "";
+  dep.home = (depPrefs[system] || {}).home || "";
+  Object.assign(dep, {
+    loaded: false, data: null, focus: null, edge: null, autoFocus: false, viewFocus: null,
+    up: new Map(), down: new Map(), stmts: new Map(), colsByTarget: new Map(), colIndex: new Map(),
+    nodes: new Set(),
+  });
+  writePrefs();
+  $("dep-search").value = "";
+  renderSystemTexts();
+  if (reload) loadLineage(true);
+}
+
+function renderSystemTexts() {
+  const sys = SYSTEMS[dep.system];
+  document.querySelectorAll(".sys-switch [data-system]").forEach((b) => {
+    const on = b.dataset.system === dep.system;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on);
+  });
+  $("dep-scan-title").textContent = `Thư mục job ${sys.tool} (${sys.name})`;
+  $("dep-folder").dataset.empty = `Bấm để chọn thư mục chứa job ${sys.tool} (${sys.exts})`;
+  $("dep-home-label").textContent = sys.home;
+  $("dep-home").dataset.empty = sys.homeEmpty;
+  $("dep-drop-hint").textContent = `Có thể kéo thả thư mục vào khung này. Kéo thả thì trình duyệt không cho biết đường dẫn thật, nên đường dẫn bắt đầu bằng biến (như ${dep.system === "new" ? "${PROJECT_HOME}" : "${ETL_HOME}"}) được khớp theo phần đuôi.`;
+  renderPickers();
+}
 
 function renderPickers() {
   const show = (id, value) => {
@@ -1553,7 +1726,7 @@ function renderDepStatus() {
 function pickDefaultFocus() {
   // Bang nguoi dung tu chon thi giu nguyen; bang tu chon thi duoc chon lai khi danh sach/ket qua doi.
   if (!dep.data || (dep.focus && dep.nodes.has(dep.focus) && !dep.autoFocus)) return;
-  const matched = (deps || [])
+  const matched = (curDeps() || [])
     .map((d, i) => (d && d.node && dep.nodes.has(d.node) ? [d.node, statusOf(i)] : null))
     .filter(Boolean);
   const links = (n) => realNeighbors(n, "up").size + realNeighbors(n, "down").size;
@@ -1600,8 +1773,8 @@ async function loadLineage(force = false) {
     return;
   }
   try {
-    const data = await api("/api/lineage");
-    if (!deps) await refreshDeps();
+    const data = await api(`/api/lineage?system=${dep.system}`);
+    if (!curDeps()) await refreshDeps();
     dep.loaded = true;
     dep.data = data.scanned ? data : null;
     setLineage(data);
@@ -1635,7 +1808,7 @@ function showScanProgress(text, share) {
 
 function scanProgressText(p) {
   if (p.phase === "index")
-    return [`Đang liệt kê file: tìm thấy ${p.files_found || 0} file .hwf/.hpl/.sql${p.current ? ` · ${p.current}` : ""}`, null];
+    return [`Đang liệt kê file: tìm thấy ${p.files_found || 0} file ${SYSTEMS[dep.system].exts}/.sql${p.current ? ` · ${p.current}` : ""}`, null];
   if (p.phase === "scan")
     return [
       `Đang đọc job: ${p.roots_done || 0}/${p.roots_total || 0} workflow gốc · đã đọc ${p.files || 0} file · ${p.statements || 0} câu lệnh${p.current ? ` · ${p.current}` : ""}`,
@@ -1685,7 +1858,7 @@ function scanLineage() {
     return;
   }
   runScan(() =>
-    postJson("/api/lineage/scan", { folder: dep.folder, project_home: dep.home || "" }),
+    postJson("/api/lineage/scan", { folder: dep.folder, project_home: dep.home || "", system: dep.system }),
   );
 }
 
@@ -1713,7 +1886,7 @@ async function pickFolder(which) {
   if (!scanning) button.disabled = false;
 }
 
-const HOP_FILE_RE = /\.(hwf|hpl|sql)$/i;
+const HOP_FILE_RE = /\.(hwf|hpl|kjb|ktr|sql)$/i;
 
 // Doc het file .hwf/.hpl/.sql trong thu muc keo tha (ke ca thu muc con).
 async function readDroppedFolder(entry) {
@@ -1755,12 +1928,13 @@ function dropScan(entry) {
   runScan(async () => {
     showScanProgress("Đang đọc thư mục kéo thả...", null);
     const files = await readDroppedFolder(entry);
-    if (!files.length) throw new Error(`Thư mục ${entry.name} không có file .hwf/.hpl nào.`);
+    if (!files.length) throw new Error(`Thư mục ${entry.name} không có file ${SYSTEMS[dep.system].exts} nào.`);
     showScanProgress(`Đang gửi ${files.length} file lên công cụ...`, null);
     return postJson("/api/lineage/upload", {
       name: entry.name,
       files,
       project_home: dep.home || "",
+      system: dep.system,
     });
   });
 }
@@ -1898,7 +2072,7 @@ function renderGraph() {
   $("dep-tools").hidden = true;
   $("dep-graph-note").hidden = true;
   if (!dep.data) {
-    box.innerHTML = '<p class="no-match">Chưa có dữ liệu, quét job Hop trước.</p>';
+    box.innerHTML = `<p class="no-match">Chưa có dữ liệu ${SYSTEMS[dep.system].name}, quét job ${SYSTEMS[dep.system].tool} trước.</p>`;
     return;
   }
   const focus = dep.focus;
@@ -2074,6 +2248,11 @@ $("dep-home-clear").addEventListener("click", () => {
   renderPickers();
 });
 $("dep-scan").addEventListener("click", scanLineage);
+document.querySelector(".sys-switch").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-system]");
+  if (button && !scanning) switchSystem(button.dataset.system);
+});
+renderSystemTexts();
 const depDrop = $("dep-drop");
 ["dragenter", "dragover"].forEach((name) =>
   depDrop.addEventListener(name, (event) => {
@@ -2205,9 +2384,14 @@ addEventListener("resize", () => {
   if (location.hash === "#phu-thuoc" && dep.focus) applyView();
 });
 
-$("editor-form").addEventListener("input", () => {
+let tableCheckTimer = null;
+$("editor-form").addEventListener("input", (event) => {
   clearTimeout(previewTimer);
   previewTimer = setTimeout(refreshEditor, 200);
+  if (event.target.name in EDITOR_TABLES) {
+    clearTimeout(tableCheckTimer);
+    tableCheckTimer = setTimeout(checkEditorTables, 250);
+  }
 });
 
 $("editor-form").addEventListener("submit", async (event) => {
@@ -2215,6 +2399,14 @@ $("editor-form").addEventListener("submit", async (event) => {
   const row = draft();
   const item = await refreshEditor();
   if (!item || item.error) return;
+  // Trung bang da co trong danh sach: hoi lai (co the co y doi soat cung bang voi partition khac).
+  const dupText = Object.entries(EDITOR_TABLES)
+    .map(([field, info]) => {
+      const dups = duplicateRows(field, row[field]);
+      return dups.length ? `Bảng ${info.name} ${row[field]} đã có ở dòng ${dups.map((i) => i + 1).join(", ")}.` : "";
+    })
+    .filter(Boolean);
+  if (dupText.length && !confirm(`${dupText.join(" ")} Vẫn lưu bảng này?`)) return;
   const index = editingIndex;
   if (index === null) rows.push(row);
   // Sua tren chinh doi tuong cu de giu id (ke ca id dang cho server tra ve).
@@ -2292,7 +2484,7 @@ $("rows").addEventListener("click", (event) => {
   } else if (button.dataset.history !== undefined) {
     openTableHistory(Number(button.dataset.history));
   } else if (button.dataset.depOpen !== undefined) {
-    openDependency(button.dataset.depOpen);
+    openDependency(button.dataset.depOpen, button.dataset.depSystem);
   } else if (button.dataset.edit !== undefined) {
     openEditor(Number(button.dataset.edit));
   } else if (button.dataset.remove !== undefined) {

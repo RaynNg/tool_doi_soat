@@ -152,7 +152,14 @@ ADDED_COLUMNS = (
     ("ket_qua", "nghi_do", "TEXT NOT NULL DEFAULT ''"),
     ("lineage_quet", "project_home", "TEXT NOT NULL DEFAULT ''"),
     ("lineage_cot", "bieu_thuc", "TEXT NOT NULL DEFAULT ''"),
+    ("lineage_quet", "he_thong", "TEXT NOT NULL DEFAULT 'new'"),
+    ("lineage_cau_lenh", "he_thong", "TEXT NOT NULL DEFAULT 'new'"),
+    ("lineage_cau_lenh_bang", "he_thong", "TEXT NOT NULL DEFAULT 'new'"),
+    ("lineage_canh", "he_thong", "TEXT NOT NULL DEFAULT 'new'"),
+    ("lineage_cot", "he_thong", "TEXT NOT NULL DEFAULT 'new'"),
 )
+# Dong tieu de cua lan quet gan nhat theo tung he thong.
+LINEAGE_HEAD_ID = {"new": 1, "old": 2}
 HISTORY_LIMIT = 500
 
 
@@ -395,42 +402,52 @@ class Store:
 
     # ---------- phu thuoc giua cac bang (quet job Hop) ----------
 
-    def save_lineage(self, scan):
+    # he_thong: "new" = Lakehouse (job Apache Hop), "old" = Datalake (job Pentaho). Moi he thong luu rieng,
+    # quet lai he thong nao thi chi xoa du lieu cua he thong do. Id cau lenh Pentaho bat dau tu 1.000.001.
+    def save_lineage(self, scan, system="new"):
+        head_id = LINEAGE_HEAD_ID[system]
         with self.lock, self.conn:
-            for table in ("lineage_cot", "lineage_canh", "lineage_cau_lenh_bang", "lineage_cau_lenh", "lineage_quet"):
-                self.conn.execute(f"DELETE FROM {table}")
+            ids = [r[0] for r in self.conn.execute("SELECT id FROM lineage_cau_lenh WHERE he_thong=?", (system,))]
+            for table in ("lineage_cot", "lineage_canh", "lineage_cau_lenh_bang", "lineage_cau_lenh"):
+                self.conn.execute(f"DELETE FROM {table} WHERE he_thong=?", (system,))
+            self.conn.execute("DELETE FROM lineage_quet WHERE id=?", (head_id,))
             self.conn.execute(
-                "INSERT INTO lineage_quet (id, thu_muc, quet_luc, so_file, so_cau_bo_qua, canh_bao, project_home) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?)",
-                (scan["folder"], now_text(), scan["file_count"], scan["ignored"],
-                 json.dumps(scan["warnings"], ensure_ascii=False), scan.get("project_home") or ""),
-            )
-            self.conn.executemany(
-                "INSERT INTO lineage_cau_lenh (id, file, duong_di, buoc, loai_buoc, loai, sql, phan_tich_mot_phan) "
+                "INSERT INTO lineage_quet (id, thu_muc, quet_luc, so_file, so_cau_bo_qua, canh_bao, project_home, he_thong) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [(s["id"], s["file"], s["chain"], s["step"], s["step_type"], s["kind"], s["sql"], int(s["partial"]))
-                 for s in scan["statements"]],
+                (head_id, scan["folder"], now_text(), scan["file_count"], scan["ignored"],
+                 json.dumps(scan["warnings"], ensure_ascii=False), scan.get("project_home") or "", system),
             )
             self.conn.executemany(
-                "INSERT INTO lineage_cau_lenh_bang (cau_lenh_id, bang, vai_tro) VALUES (?, ?, ?)",
-                [(s["id"], t, role) for s in scan["statements"]
+                "INSERT INTO lineage_cau_lenh (id, file, duong_di, buoc, loai_buoc, loai, sql, phan_tich_mot_phan, he_thong) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(s["id"], s["file"], s["chain"], s["step"], s["step_type"], s["kind"], s["sql"], int(s["partial"]),
+                  system) for s in scan["statements"]],
+            )
+            self.conn.executemany(
+                "INSERT INTO lineage_cau_lenh_bang (cau_lenh_id, bang, vai_tro, he_thong) VALUES (?, ?, ?, ?)",
+                [(s["id"], t, role, system) for s in scan["statements"]
                  for role, names in (("dich", s["targets"]), ("nguon", s["sources"])) for t in names],
             )
-            self.conn.executemany("INSERT INTO lineage_canh (nguon, dich, cau_lenh_id) VALUES (?, ?, ?)", scan["edges"])
             self.conn.executemany(
-                "INSERT INTO lineage_cot (dich_bang, dich_cot, nguon_bang, nguon_cot, cau_lenh_id, bieu_thuc) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [tuple(c) + ("",) * (6 - len(c)) for c in scan["columns"]],
+                "INSERT INTO lineage_canh (nguon, dich, cau_lenh_id, he_thong) VALUES (?, ?, ?, ?)",
+                [tuple(e) + (system,) for e in scan["edges"]],
+            )
+            self.conn.executemany(
+                "INSERT INTO lineage_cot (dich_bang, dich_cot, nguon_bang, nguon_cot, cau_lenh_id, bieu_thuc, he_thong) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [tuple(c) + ("",) * (6 - len(c)) + (system,) for c in scan["columns"]],
             )
 
-    def load_lineage(self):
-        """Tra ve dict giong ket qua quet (kem quet_luc), hoac None neu chua quet lan nao."""
+    def load_lineage(self, system="new"):
+        """Tra ve dict giong ket qua quet (kem quet_luc), hoac None neu he thong nay chua quet lan nao."""
         with self.lock:
-            head = self.conn.execute("SELECT * FROM lineage_quet WHERE id=1").fetchone()
+            head = self.conn.execute("SELECT * FROM lineage_quet WHERE id=?", (LINEAGE_HEAD_ID[system],)).fetchone()
             if head is None:
                 return None
             roles = {}
-            for r in self.conn.execute("SELECT * FROM lineage_cau_lenh_bang ORDER BY rowid"):
+            for r in self.conn.execute(
+                "SELECT * FROM lineage_cau_lenh_bang WHERE he_thong=? ORDER BY rowid", (system,)
+            ):
                 roles.setdefault(r["cau_lenh_id"], {"dich": [], "nguon": []})[r["vai_tro"]].append(r["bang"])
             statements = [
                 {
@@ -440,12 +457,15 @@ class Store:
                     "targets": roles.get(r["id"], {}).get("dich", []),
                     "sources": roles.get(r["id"], {}).get("nguon", []),
                 }
-                for r in self.conn.execute("SELECT * FROM lineage_cau_lenh ORDER BY id")
+                for r in self.conn.execute("SELECT * FROM lineage_cau_lenh WHERE he_thong=? ORDER BY id", (system,))
             ]
-            edges = [tuple(r) for r in self.conn.execute("SELECT nguon, dich, cau_lenh_id FROM lineage_canh")]
+            edges = [tuple(r) for r in self.conn.execute(
+                "SELECT nguon, dich, cau_lenh_id FROM lineage_canh WHERE he_thong=?", (system,)
+            )]
             columns = [
                 tuple(r) for r in self.conn.execute(
-                    "SELECT dich_bang, dich_cot, nguon_bang, nguon_cot, cau_lenh_id, bieu_thuc FROM lineage_cot"
+                    "SELECT dich_bang, dich_cot, nguon_bang, nguon_cot, cau_lenh_id, bieu_thuc FROM lineage_cot "
+                    "WHERE he_thong=?", (system,)
                 )
             ]
         try:

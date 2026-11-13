@@ -81,7 +81,12 @@ store = None
 migrate_problem = ""
 # Graph phu thuoc doc tu DB mot lan, quet lai thi thay moi.
 lineage_lock = threading.Lock()
-lineage_cache = {"loaded": False, "data": None, "graph": None}
+# Moi he thong mot graph: Lakehouse quet job Apache Hop, Datalake quet job Pentaho.
+LINEAGE_SYSTEMS = {
+    "new": {"name": "Lakehouse", "fmt": "hop", "field": "new_table"},
+    "old": {"name": "Datalake", "fmt": "kettle", "field": "old_table"},
+}
+lineage_cache = {s: {"loaded": False, "data": None, "graph": None} for s in LINEAGE_SYSTEMS}
 
 
 def get_store():
@@ -164,6 +169,8 @@ def connect(cfg, cancel):
 
 
 def run_query(cfg, sql, cancel):
+    # Chot chan cuoi: chi gui cau SELECT len Thrift, khong bao gio chay lenh ghi/sua/xoa.
+    reconcile.ensure_read_only(sql)
     # Chi thu lai buoc ket noi; query da gui len server thi khong chay lai de tranh tai gap doi.
     conn = connect(cfg, cancel)
     try:
@@ -188,11 +195,12 @@ def error_text(exc):
     return message[:ERROR_TEXT_LIMIT]
 
 
-def row_nodes(graph, raw_rows):
-    """Bang Lakehouse cua tung dong -> nut trong graph phu thuoc (None neu chua quet/khong thay)."""
+def row_nodes(graph, raw_rows, system="new"):
+    """Bang cua tung dong (Lakehouse: new_table, Datalake: old_table) -> nut trong graph (None neu khong thay)."""
     if graph is None:
         return [None] * len(raw_rows)
-    return [graph.match(r.get("new_table")) for r in raw_rows]
+    field = LINEAGE_SYSTEMS[system]["field"]
+    return [graph.match(r.get(field)) for r in raw_rows]
 
 
 def listed_nodes(nodes):
@@ -213,9 +221,14 @@ def row_dependencies(graph, nodes, direction="up"):
     return result
 
 
-def metric_column(label):
-    """Nhan chi so 'a → b' hoac 'b' -> bieu thuc cot Lakehouse."""
-    return label.split(" → ")[-1]
+def metric_column(label, system="new"):
+    """Nhan chi so 'a → b' hoac 'b' -> bieu thuc cot (Lakehouse lay ve phai, Datalake lay ve trai)."""
+    parts = label.split(" → ")
+    return parts[-1] if system == "new" else parts[0]
+
+
+def system_of(system):
+    return system if system in LINEAGE_SYSTEMS else "new"
 
 
 def decimal_or_none(text):
@@ -226,7 +239,7 @@ def decimal_or_none(text):
 
 
 class Job:
-    def __init__(self, prepared, cfgs, threshold, selected=None, raw_rows=None, date="", gate=False, graph=None):
+    def __init__(self, prepared, cfgs, threshold, selected=None, raw_rows=None, date="", gate=False, graphs=None):
         self.id = uuid.uuid4().hex
         # Bien thoi gian tinh lai ngay truoc khi chay tung bang (N theo gio thuc te luc chay).
         self.raw_rows = raw_rows
@@ -244,7 +257,6 @@ class Job:
         self.remaining = 0
         self.pool = None
         self.gate = gate
-        self.graph = graph
         self.rows = []
         for index, item in enumerate(prepared):
             base = {"error": "", "verdict": "", "metrics": [], "prepared": item, "sides": {},
@@ -259,8 +271,13 @@ class Job:
                 self.remaining += 2
         if not self.remaining:
             self.state = "done"
-        self.nodes = row_nodes(graph, raw_rows or [{} for _ in prepared])
-        self.listed = listed_nodes(self.nodes)
+        # Moi he thong da quet: (he thong, graph, nut cua tung dong, nut -> cac dong).
+        rows_raw = raw_rows or [{} for _ in prepared]
+        self.views = []
+        for system, graph in (graphs or {}).items():
+            if graph is not None:
+                nodes = row_nodes(graph, rows_raw, system)
+                self.views.append((system, graph, nodes, listed_nodes(nodes)))
         self.deps = {i: set() for i in range(len(self.rows))}
         self.dependents = {i: set() for i in range(len(self.rows))}
         self.waiting = {}
@@ -270,30 +287,36 @@ class Job:
         raw = self.raw_rows[index] if self.raw_rows is not None else {}
         return raw.get("new_table") or raw.get("old_table") or f"dòng {index + 1}"
 
+    def upstream_rows(self, i):
+        """Cac dong la bang nguon gan nhat cua dong i, gop ca graph Lakehouse (Hop) va Datalake (Pentaho)."""
+        found = []
+        for _, graph, nodes, listed in self.views:
+            if not nodes[i]:
+                continue
+            for up_node in graph.nearest_listed(nodes[i], listed):
+                for j in listed[up_node]:
+                    if j != i and j not in found:
+                        found.append(j)
+        return found
+
     def plan(self):
         """Tim bang nguon trong luot nay cua tung bang; bat chan thi bang chi chay khi nguon da xong."""
-        if self.graph is None:
+        if not self.views:
             return
         picked = {i for i, r in enumerate(self.rows) if r["state"] != "skipped"}
         runnable = {i for i in picked if self.rows[i]["state"] == "pending"}
         for i in sorted(picked):
-            node = self.nodes[i]
-            if not node:
-                continue
-            for up_node in self.graph.nearest_listed(node, self.listed):
-                for j in self.listed[up_node]:
-                    if j == i:
-                        continue
-                    self.rows[i]["upstream"].append(self.name(j))
-                    if j not in picked:
-                        continue
-                    if self.rows[j]["state"] == "error":
-                        self.rows[i]["warnings"].append(
-                            f"Bảng nguồn {self.name(j)} sai cấu hình nên không đối soát được, "
-                            "kết quả bảng này chưa chắc do nguồn hay do chính nó."
-                        )
-                    elif self.gate and i in runnable and j in runnable:
-                        self.deps[i].add(j)
+            for j in self.upstream_rows(i):
+                self.rows[i]["upstream"].append(self.name(j))
+                if j not in picked:
+                    continue
+                if self.rows[j]["state"] == "error":
+                    self.rows[i]["warnings"].append(
+                        f"Bảng nguồn {self.name(j)} sai cấu hình nên không đối soát được, "
+                        "kết quả bảng này chưa chắc do nguồn hay do chính nó."
+                    )
+                elif self.gate and i in runnable and j in runnable:
+                    self.deps[i].add(j)
         # Vong phu thuoc (a <- b <- a): bo chan giua cac bang trong vong, van chay binh thuong.
         left = {i: set(d) for i, d in self.deps.items()}
         changed = True
@@ -396,11 +419,17 @@ class Job:
                     f"Bảng nguồn {self.name(j)} lỗi query, kết quả bảng này chưa chắc do nguồn hay do chính nó."
                 )
         if bad and not self.cancel.is_set():
-            reasons = [
-                f"{self.name(j)} {'bị bỏ qua' if self.rows[j]['state'] == 'blocked' else 'lệch quá ngưỡng'}"
-                for j in bad
-            ]
-            row.update(state="blocked", error="Không đối soát vì bảng nguồn " + ", ".join(reasons) + ".")
+            # Chuoi tu bang nguon bi lech toi bang nay: a → b → c (b bi bo qua vi a lech, c vi b).
+            chains = []
+            for j in bad:
+                up = self.rows[j]
+                for chain in (up.get("chains") or [[]]) if up["state"] == "blocked" else [[self.name(j)]]:
+                    chain = chain + [self.name(index)]
+                    if chain not in chains:
+                        chains.append(chain)
+            row["chains"] = chains
+            text = "; ".join(" → ".join(c) for c in chains)
+            row.update(state="blocked", error=f"Không đối soát vì bảng nguồn lệch quá ngưỡng: {text}.")
             self.log_row(index)
             self.remaining -= 2
             self.release(index)
@@ -426,7 +455,7 @@ class Job:
             except ValueError as exc:
                 row.update(state="error", error=str(exc))
                 return
-            if not self.gate and self.graph is not None:
+            if not self.gate and self.views:
                 for name in self.upstream_lech(index):
                     row["warnings"].append(f"Bảng nguồn {name} lệch quá ngưỡng trong lượt này.")
             if any(not m["ok"] for m in metrics):
@@ -454,16 +483,10 @@ class Job:
                     self.log_error = f"Chưa ghi được lịch sử vào {DB_FILE}: {exc}"
 
     def upstream_lech(self, index):
-        node = self.nodes[index]
-        if not node:
-            return []
-        names = []
-        for up_node in self.graph.nearest_listed(node, self.listed):
-            for j in self.listed[up_node]:
-                up = self.rows[j]
-                if j != index and up["state"] == "done" and up["verdict"] == "lech":
-                    names.append(self.name(j))
-        return names
+        return [
+            self.name(j) for j in self.upstream_rows(index)
+            if self.rows[j]["state"] == "done" and self.rows[j]["verdict"] == "lech"
+        ]
 
     # ---------- truy nguyen nhan lech ----------
 
@@ -484,47 +507,66 @@ class Job:
         return {"metrics": hit["metrics"], "from": f"Lịch sử lượt #{hit['luot_chay_id']} ({hit['ket_thuc_luc']})"}
 
     def explain(self, index):
-        """Voi tung chi so lech cua bang: bang nguon nao (va cot nao) co the gay ra."""
-        node = self.nodes[index]
-        if self.graph is None or not node:
+        """Voi tung chi so lech cua bang: bang nguon nao (va cot nao) co the gay ra.
+
+        Xet ca hai he thong: Lakehouse theo job Hop (cot ve phai cua nhan), Datalake theo job Pentaho
+        (cot ve trai). Cay truy nguon moi he thong rieng de so duoc logic ETL cu va moi.
+        """
+        views = [(sys_, g, nodes[index], listed) for sys_, g, nodes, listed in self.views if nodes[index]]
+        if not views:
             return None
         row = self.rows[index]
         cache = {}
         writers = [
-            {"id": s["id"], "kind": s["kind"], "file": s["file"], "step": s["step"], "sql": s["sql"][:SQL_SNIPPET]}
-            for s in self.graph.writers_of(node)
+            {"id": s["id"], "kind": s["kind"], "file": s["file"], "step": s["step"], "sql": s["sql"][:SQL_SNIPPET],
+             "system": sys_}
+            for sys_, g, node, _ in views for s in g.writers_of(node)
         ]
         items = []
         for metric in row["metrics"]:
             if metric["ok"]:
                 continue
-            entries, mode = [], "bang"
+            entries, mode, trees, seen = [], "bang", [], set()
             if metric["kind"] == "sum":
-                for col in lineage.expression_columns(metric_column(metric["label"])):
-                    hits, has_lineage = self.graph.trace_column(node, col, self.listed)
-                    if has_lineage:
-                        mode = "cot"
-                    for hit in hits:
-                        for j in self.listed[hit["table"]]:
-                            if j != index:
-                                entries.append(self.column_entry(j, hit, cache))
+                for sys_, g, node, listed in views:
+                    for col in lineage.expression_columns(metric_column(metric["label"], sys_)):
+                        hits, has_lineage = g.trace_column(node, col, listed)
+                        if has_lineage:
+                            mode = "cot"
+                        for hit in hits:
+                            for j in listed[hit["table"]]:
+                                if j == index:
+                                    continue
+                                # Cung bang + cung cot ma ca hai graph cung chi ra thi gop lam mot dong.
+                                twin = next((e for e in entries if e["row"] == j and
+                                             e["column"].lower() == hit["column"].lower()), None)
+                                if twin is not None:
+                                    if twin["system"] != sys_:
+                                        twin["system"] = "both"
+                                    continue
+                                seen.add(j)
+                                entries.append(self.column_entry(j, hit, cache, sys_))
+                        # Cay truy nguon cot: cot duoc tinh tu cot nao, o job nao (ca bang ngoai danh sach).
+                        trees.append({**g.column_tree(node, col, listed), "system": sys_})
             if mode == "bang":
-                for up_node, path in self.graph.nearest_listed(node, self.listed).items():
-                    for j in self.listed[up_node]:
-                        if j != index:
-                            entries.append(self.table_entry(j, path, metric["kind"], cache))
+                for sys_, g, node, listed in views:
+                    for up_node, path in g.nearest_listed(node, listed).items():
+                        for j in listed[up_node]:
+                            if j == index:
+                                continue
+                            twin = next((e for e in entries if e["row"] == j), None)
+                            if twin is not None:
+                                if twin["system"] != sys_:
+                                    twin["system"] = "both"
+                                continue
+                            entries.append(self.table_entry(j, path, metric["kind"], cache, sys_))
             entries.sort(key=lambda e: (e["pct"] is None, -(decimal_or_none(e["pct"]) or 0)))
-            trees = []
-            if metric["kind"] == "sum":
-                # Cay truy nguon cot: cot nay duoc tinh tu cot nao, o job nao (ca bang ngoai danh sach).
-                trees = [self.graph.column_tree(node, col, self.listed)
-                         for col in lineage.expression_columns(metric_column(metric["label"]))]
             items.append({"label": metric["label"], "mode": mode, "entries": entries, "trees": trees,
-                          "summary": self.summary(metric, mode, entries, node)})
-        return {"table": node, "writers": writers, "metrics": items}
+                          "summary": self.summary(metric, mode, entries, self.name(index))})
+        return {"table": self.name(index), "writers": writers, "metrics": items}
 
-    def column_entry(self, j, hit, cache):
-        entry = {"table": self.name(j), "column": hit["column"], "path": hit["path"],
+    def column_entry(self, j, hit, cache, system="new"):
+        entry = {"table": self.name(j), "row": j, "column": hit["column"], "path": hit["path"], "system": system,
                  "label": "", "pct": None, "diff": None, "ok": None, "from": "", "note": ""}
         result = self.source_result(j, cache)
         if result is None:
@@ -532,7 +574,7 @@ class Job:
             return entry
         entry["from"] = result["from"]
         for m in result["metrics"]:
-            if m["kind"] == "sum" and hit["column"] in lineage.expression_columns(metric_column(m["label"])):
+            if m["kind"] == "sum" and hit["column"] in lineage.expression_columns(metric_column(m["label"], system)):
                 entry.update(label=m["label"], pct=m["pct"], diff=m["diff"], ok=m["ok"])
                 return entry
         entry["note"] = f"Cột {hit['column']} chưa có trong cột tiền đối soát của bảng này."
@@ -541,9 +583,9 @@ class Job:
             entry.update(label=count["label"], pct=count["pct"], diff=count["diff"], ok=count["ok"])
         return entry
 
-    def table_entry(self, j, path, kind, cache):
-        entry = {"table": self.name(j), "column": "", "path": path, "label": "", "pct": None, "diff": None,
-                 "ok": None, "from": "", "note": ""}
+    def table_entry(self, j, path, kind, cache, system="new"):
+        entry = {"table": self.name(j), "row": j, "column": "", "path": path, "system": system, "label": "", "pct": None,
+                 "diff": None, "ok": None, "from": "", "note": ""}
         result = self.source_result(j, cache)
         if result is None:
             entry["note"] = "Chưa có kết quả đối soát cùng ngày."
@@ -644,6 +686,7 @@ class Job:
             rows = []
             for i, row in enumerate(self.rows):
                 item = {k: row[k] for k in ("state", "error", "verdict", "metrics", "warnings", "cause", "upstream")}
+                item["chains"] = row.get("chains") or []
                 if row["state"] == "pending" and self.waiting.get(i):
                     item["waiting"] = [self.name(j) for j in sorted(self.deps[i]) if self.rows[j]["state"] in ("pending", "running")]
                 rows.append(item)
@@ -842,11 +885,13 @@ def run():
     gate = bool(data.get("gate"))
     now = datetime.now()
     prepared = [reconcile.prepare_row(r, date, now) for r in data["rows"]]
-    try:
-        _, graph = get_lineage()
-    except sqlite3.Error:
-        graph = None
-    job = Job(prepared, cfgs, threshold, selected, data["rows"], date, gate, graph)
+    graphs = {}
+    for system in LINEAGE_SYSTEMS:
+        try:
+            graphs[system] = get_lineage(system)[1]
+        except sqlite3.Error:
+            graphs[system] = None
+    job = Job(prepared, cfgs, threshold, selected, data["rows"], date, gate, graphs)
     picked = [i for i in range(len(prepared)) if selected is None or i in selected]
 
     with jobs_lock:
@@ -860,7 +905,7 @@ def run():
         try:
             job.store = get_store()
             job.run_id = job.store.start_run(
-                date, threshold, parallel, cfgs, len(picked), sql_path, gate and graph is not None
+                date, threshold, parallel, cfgs, len(picked), sql_path, gate and bool(job.views)
             )
         except sqlite3.Error as exc:
             return jsonify(error=f"Chưa ghi được lượt chạy vào {DB_FILE}: {exc}"), 500
@@ -911,13 +956,14 @@ def handle_db_error(exc):
     return jsonify(error=f"Lỗi đọc/ghi {DB_FILE}: {exc}"), 500
 
 
-def get_lineage():
+def get_lineage(system="new"):
+    cache = lineage_cache[system]
     with lineage_lock:
-        if not lineage_cache["loaded"]:
-            data = get_store().load_lineage()
+        if not cache["loaded"]:
+            data = get_store().load_lineage(system)
             graph = lineage.Graph(data["statements"], data["edges"], data["columns"]) if data else None
-            lineage_cache.update(loaded=True, data=data, graph=graph)
-        return lineage_cache["data"], lineage_cache["graph"]
+            cache.update(loaded=True, data=data, graph=graph)
+        return cache["data"], cache["graph"]
 
 
 def lineage_payload(data):
@@ -931,7 +977,7 @@ def lineage_payload(data):
 
 @app.get("/api/lineage")
 def lineage_get():
-    data, _ = get_lineage()
+    data, _ = get_lineage(system_of(request.args.get("system")))
     return jsonify(lineage_payload(data))
 
 
@@ -943,7 +989,7 @@ def clean_path(text):
     return str(text or "").strip().strip('"').strip()
 
 
-def start_scan(folder, project_home, label=None, cleanup=None):
+def start_scan(folder, project_home, label=None, cleanup=None, system="new"):
     """Quet o luong rieng; giao dien hoi /api/lineage/scan/<id> de hien tien do."""
     with scan_jobs_lock:
         if any(j["state"] == "running" for j in scan_jobs.values()):
@@ -959,11 +1005,11 @@ def start_scan(folder, project_home, label=None, cleanup=None):
 
     def work():
         try:
-            scan = lineage.scan_folder(folder, project_home or None, report, label)
+            scan = lineage.scan_folder(folder, project_home or None, report, label, LINEAGE_SYSTEMS[system]["fmt"])
             report(phase="save")
             with lineage_lock:
-                get_store().save_lineage(scan)
-                lineage_cache.update(loaded=False)
+                get_store().save_lineage(scan, system)
+                lineage_cache[system].update(loaded=False)
             job["state"] = "done"
         except ValueError as exc:
             job.update(state="error", error=str(exc))
@@ -981,10 +1027,12 @@ def start_scan(folder, project_home, label=None, cleanup=None):
 def lineage_scan():
     data = request.get_json() or {}
     folder = clean_path(data.get("folder"))
+    system = system_of(data.get("system"))
     if not folder:
-        raise ValueError("Chưa nhập thư mục chứa job Hop.")
+        raise ValueError("Chưa chọn thư mục chứa job.")
     project_home = clean_path(data.get("project_home"))
-    job_id = start_scan(os.path.abspath(folder), os.path.abspath(project_home) if project_home else None)
+    job_id = start_scan(os.path.abspath(folder), os.path.abspath(project_home) if project_home else None,
+                        system=system)
     if job_id is None:
         return jsonify(error="Đang có một lượt quét chạy."), 409
     return jsonify(id=job_id)
@@ -1000,7 +1048,7 @@ def lineage_upload():
     name = re.sub(r'[\\/:*?"<>|]', "_", str(data.get("name") or "").strip()) or "thu_muc"
     files = data.get("files") or []
     if not files:
-        raise ValueError("Thư mục kéo thả không có file .hwf/.hpl nào.")
+        raise ValueError("Thư mục kéo thả không có file job nào.")
     temp = tempfile.mkdtemp(prefix="doi_soat_hop_")
     root = os.path.join(temp, name)
     written = 0
@@ -1019,7 +1067,8 @@ def lineage_upload():
         raise ValueError(f"Không ghi tạm được file kéo thả: {exc}") from None
     project_home = clean_path(data.get("project_home"))
     job_id = start_scan(root, os.path.abspath(project_home) if project_home else None,
-                        label=f"{name} (kéo thả, {written} file)", cleanup=temp)
+                        label=f"{name} (kéo thả, {written} file)", cleanup=temp,
+                        system=system_of(data.get("system")))
     if job_id is None:
         return jsonify(error="Đang có một lượt quét chạy."), 409
     return jsonify(id=job_id)
@@ -1048,7 +1097,7 @@ def pick_folder():
         root.withdraw()
         root.attributes("-topmost", True)
         folder = filedialog.askdirectory(
-            parent=root, title="Chọn thư mục chứa job Hop",
+            parent=root, title="Chọn thư mục",
             initialdir=start if start and os.path.isdir(start) else None,
         )
     finally:
@@ -1059,11 +1108,13 @@ def pick_folder():
 @app.post("/api/lineage/deps")
 def lineage_deps():
     """Bang nguon/dich gan nhat cua tung dong trong danh sach (theo chi so dong)."""
-    rows = (request.get_json() or {}).get("rows") or []
-    _, graph = get_lineage()
+    data = request.get_json() or {}
+    rows = data.get("rows") or []
+    system = system_of(data.get("system"))
+    _, graph = get_lineage(system)
     if graph is None:
         return jsonify(scanned=False, rows=[])
-    nodes = row_nodes(graph, rows)
+    nodes = row_nodes(graph, rows, system)
     ups = row_dependencies(graph, nodes, "up")
     downs = row_dependencies(graph, nodes, "down")
     return jsonify(

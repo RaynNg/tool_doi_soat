@@ -91,6 +91,8 @@ def build_config(args):
 
 
 def run_query(cfg, sql, cancel, timeout):
+    # Chot chan cuoi: chi gui cau SELECT len Thrift, khong bao gio chay lenh ghi/sua/xoa.
+    reconcile.ensure_read_only(sql)
     from pyhive import hive
     from TCLIService.ttypes import TOperationState
 

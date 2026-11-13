@@ -456,7 +456,7 @@ dialog::backdrop { background: rgba(22, 24, 29, .5); }
   filter: drop-shadow(0 0 2px rgba(255, 168, 188, .9)) drop-shadow(0 0 10px rgba(255, 182, 200, .6)) drop-shadow(0 0 22px rgba(255, 198, 212, .45)); }
 .colhead { font: 700 11px var(--font); letter-spacing: .08em; text-anchor: middle; }
 .colhead.up { fill: var(--navy); }
-.colhead.down { fill: var(--brand-dark); }
+.colhead.down { fill: var(--text); }
 .colhead.focus { fill: var(--navy); }
 .graph-svg .empty { font: 400 13px var(--font); fill: #a4947a; text-anchor: middle; }
 .gedge { cursor: pointer; }
@@ -657,3 +657,29 @@ kbd { padding: 1px 7px; font: 600 11px/16px var(--font); color: var(--beige-ink)
 .kind-merge { background: #7048e8 !important; color: #fff !important; }
 .kind-alter { background: #e6b400 !important; color: #3d2e00 !important; }
 .kind-select { background: #6b7180 !important; color: #fff !important; }
+
+/* Chon he thong tren trang Phu thuoc (nam tren khoi tieu de do). */
+.sys-switch { display: inline-flex; gap: 4px; margin-top: 14px; padding: 4px; background: rgba(255, 255, 255, .14); border: 1px solid rgba(255, 255, 255, .3); border-radius: 999px; }
+.sys-switch button { height: 32px; padding: 0 14px; font: 600 13px var(--font); color: #ffe9ed; background: none; border: 0; border-radius: 999px; cursor: pointer; transition: background .14s, color .14s; }
+.sys-switch button:hover { color: #fff; background: rgba(255, 255, 255, .12); }
+.sys-switch button.active { color: var(--brand-dark); background: #fff; box-shadow: 0 2px 8px rgba(120, 0, 30, .25); }
+/* Nhan he thong trong Nghi do / phu thuoc tung dong. */
+.sys-tag { display: inline-block; margin: 0 6px 0 0; padding: 0 7px; font-size: 10.5px; line-height: 17px; font-weight: 700; border-radius: 5px; vertical-align: 1px; }
+.sys-tag.new { color: #fff; background: var(--navy); }
+.sys-tag.old { color: var(--beige-ink); background: var(--beige); border: 1px solid #dccfb6; }
+.sys-tag.both { color: #4b2f8f; background: #f1ecfb; }
+.cause-table .tables .sys-tag { margin: 0 0 0 6px; }
+
+/* Chuoi bang bi bo qua: mot dong in dam, chu dan va mui ten mau den. */
+.chain-text { margin: 0; font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
+.chain-name.src { color: var(--brand-dark); }
+.chain-name.next { color: var(--text); }
+.chain-arrow { color: var(--text); }
+
+/* Goi y ngay duoi o ten bang trong hop thoai Them/Sua. */
+.field-hint { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 12px; line-height: 18px; font-weight: 500; }
+.field-hint:empty { display: none; }
+.field-hint > span { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 6px; }
+.hint-warn { color: #6b4600; background: #fff1cc; }
+.hint-ok { color: #04542a; background: #dcf8e7; }
+.hint-muted { color: var(--muted); background: var(--raised); }

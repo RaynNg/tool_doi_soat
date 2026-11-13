@@ -19,6 +19,19 @@ from collections import deque
 WORKFLOW_EXT = ".hwf"
 PIPELINE_EXT = ".hpl"
 SQL_EXT = ".sql"
+# Hop (Lakehouse) tach ra tu Pentaho/Kettle (Datalake) nen XML gan giong nhau, chi khac ten the va loai buoc.
+FORMATS = {
+    "hop": {
+        "label": "Apache Hop", "wf": ".hwf", "pl": ".hpl", "action": "action", "step": "transform",
+        "wf_types": ("WORKFLOW",), "pl_types": ("PIPELINE",), "id_base": 0,
+    },
+    "kettle": {
+        "label": "Pentaho", "wf": ".kjb", "pl": ".ktr", "action": "entry", "step": "step",
+        "wf_types": ("JOB",), "pl_types": ("TRANS",), "id_base": 1_000_000,
+    },
+}
+EXECUTOR_TYPES = ("PipelineExecutor", "WorkflowExecutor", "SimpleMapping", "Mapping", "MetaInject",
+                  "SingleThreader", "TransExecutor", "JobExecutor")
 MAX_DEPTH = 40
 MAX_EXPR = 500
 TEMP_PREFIX = "temp:"
@@ -675,14 +688,21 @@ def describe_expr(sel, expr, depth=0):
     return text
 
 
-def _insert_columns(target, columns, query, exprs=None):
+def _insert_columns(target, columns, query, exprs=None, positional=None):
     """Quan he cot cho INSERT ... SELECT: theo vi tri (co danh sach cot) hoac theo ten alias.
 
     exprs: dict nhan them {(bang, cot): bieu thuc nguon} de hien cot duoc tinh the nao.
+    positional: list nhan them tung cot theo vi tri (khi khong ghi danh sach cot) de luc dung graph
+    ghep lai theo dung thu tu cot trong CREATE TABLE (Hive/Spark INSERT ghep cot theo vi tri).
     """
     edges = []
     first = query.branches[0].items if query.branches else []
-    for k, (alias, refs, star) in enumerate(output_columns(query)):
+    outputs = output_columns(query)
+    if positional is not None and not columns:
+        for k, (alias, refs, star) in enumerate(outputs):
+            expr = describe_expr(query.branches[0], first[k][1]) if k < len(first) and first[k][1] else ""
+            positional.append({"alias": alias, "refs": sorted(refs), "star": sorted(star) if star else None, "expr": expr})
+    for k, (alias, refs, star) in enumerate(outputs):
         tcol = columns[k] if columns and k < len(columns) else alias
         if exprs is not None and tcol and star is None and k < len(first) and first[k][1]:
             exprs[(target, tcol)] = describe_expr(query.branches[0], first[k][1])
@@ -711,6 +731,7 @@ def analyze(toks, use_db=None):
     result = {
         "kind": "", "targets": [], "sources": [], "columns": [], "locations": [],
         "temp_views": [], "use": None, "partial": False, "output": [], "exprs": {}, "output_exprs": {},
+        "positional": [], "schema": [],
     }
     if first == "use":
         name, _ = read_name(toks, 1, allow_keyword=True)
@@ -769,6 +790,10 @@ def analyze(toks, use_db=None):
         result["columns"] = [(qualify(a), b, qualify(c), d) for a, b, c, d in result["columns"]]
         result["locations"] = [(qualify(a), b) for a, b in result["locations"]]
         result["exprs"] = {(qualify(t), c): e for (t, c), e in result["exprs"].items()}
+        for item in result["positional"]:
+            item["refs"] = [(qualify(t), c) for t, c in item["refs"]]
+            if item["star"]:
+                item["star"] = [qualify(t) for t in item["star"]]
         result["output"] = [
             (alias, {(qualify(t), c) for t, c in refs}, None if star is None else {qualify(t) for t in star})
             for alias, refs, star in result["output"]
@@ -813,7 +838,7 @@ def _analyze_insert(toks, i, ctes, result):
     # Quet ca cau (ke ca phan WITH truoc INSERT); scan_tables tu bo ten CTE.
     result["sources"] = [s for s in scan_tables(toks) if s != name]
     query = parse_query(toks, i, len(toks), ctes)
-    result["columns"] = _insert_columns(name, columns, query, result["exprs"])
+    result["columns"] = _insert_columns(name, columns, query, result["exprs"], result["positional"])
 
 
 def _analyze_create(toks, result):
@@ -838,6 +863,11 @@ def _analyze_create(toks, result):
     if loc >= 0 and literal(at(toks, loc + 1)):
         result["locations"].append((name, normalize_location(literal(toks[loc + 1]))))
     columns, _ = _column_list(toks, i) if is_view else (None, i)
+    if not is_view and is_op(at(toks, i), "("):
+        result["schema"] = _column_defs(toks, i)
+        part = _top_level_find(toks, i, {"partitioned"})
+        if part >= 0 and is_kw(at(toks, part + 1), "by") and is_op(at(toks, part + 2), "("):
+            result["schema"] += _column_defs(toks, part + 2)
     as_pos = _top_level_find(toks, i, {"as"})
     start = -1
     if as_pos >= 0 and (is_word(at(toks, as_pos + 1)) and toks[as_pos + 1].low in QUERY_STARTS or is_op(at(toks, as_pos + 1), "(")):
@@ -848,8 +878,21 @@ def _analyze_create(toks, result):
     if start >= 0:
         result["sources"] = [s for s in scan_tables(toks[start:]) if s != name]
         query = parse_query(toks, start, len(toks), {})
-        result["columns"] = _insert_columns(name, columns, query, result["exprs"])
+        result["columns"] = _insert_columns(name, columns, query, result["exprs"], result["positional"])
     return True
+
+
+def _column_defs(toks, i):
+    """(a int, b decimal(18,2), PRIMARY KEY (a)) -> [a, b]: ten cot theo thu tu khai bao."""
+    close = close_paren(toks, i)
+    cols = []
+    for part in _split_commas(toks[i + 1:close]):
+        if not part or (part[0].kind == "word" and part[0].low in ("primary", "constraint", "foreign", "unique", "key", "index", "check")):
+            continue
+        name = name_part(part[0])
+        if name and len(part) > 1:
+            cols.append(name)
+    return cols
 
 
 def _analyze_alter(toks, result):
@@ -1022,7 +1065,11 @@ def _first_text(elem, tag):
 DIR_VARS = (
     "Internal.Entry.Current.Folder", "Internal.Workflow.Filename.Directory",
     "Internal.Pipeline.Filename.Directory", "Internal.Transform.Current.Folder",
+    # Pentaho
+    "Internal.Entry.Current.Directory", "Internal.Job.Filename.Directory",
+    "Internal.Transformation.Filename.Directory",
 )
+LEADING_VAR_RE = re.compile(r"^\$\{([^}]+)\}[\\/]*")
 PROJECT_VARS = ("PROJECT_HOME", "Internal.Project.Home")
 PATH_SPLIT_RE = re.compile(r"[\\/]+")
 
@@ -1037,10 +1084,12 @@ class Scanner:
     progress(**trang_thai): goi lien tuc trong luc quet de giao dien hien tien do.
     """
 
-    def __init__(self, root, project_home=None, progress=None):
+    def __init__(self, root, project_home=None, progress=None, fmt="hop"):
         self.root = os.path.abspath(root)
+        self.fmt = FORMATS[fmt]
         self.project_home = os.path.abspath(project_home) if project_home else None
-        self.detected_home = None
+        # Thu muc goc tu do cho tung bien dau duong dan (${PROJECT_HOME}, ${ETL_HOME}...).
+        self.detected_homes = {}
         self.progress = progress or (lambda **_: None)
         self.warnings = []
         self.statements = []
@@ -1066,7 +1115,7 @@ class Scanner:
         count = 0
         for folder, _, files in os.walk(self.root):
             for f in files:
-                if f.lower().endswith((WORKFLOW_EXT, PIPELINE_EXT, SQL_EXT)):
+                if f.lower().endswith((self.fmt["wf"], self.fmt["pl"], SQL_EXT)):
                     self.by_name.setdefault(f.lower(), []).append(os.path.join(folder, f))
                     count += 1
             self.progress(phase="index", files_found=count, current=self.rel(folder))
@@ -1084,14 +1133,13 @@ class Scanner:
         text = raw.strip()
         for var in DIR_VARS:
             text = text.replace("${" + var + "}", here)
-        rest = None
-        for var in PROJECT_VARS:
-            token = "${" + var + "}"
-            if text.startswith(token):
-                rest = text[len(token):].lstrip("/\\")
+        rest, var = None, None
+        lead = LEADING_VAR_RE.match(text)
+        if lead:
+            var, rest = lead.group(1), text[lead.end():]
         candidates = []
         if rest is not None and "${" not in rest:
-            candidates = [os.path.join(home, rest) for home in self.home_candidates(rest)]
+            candidates = [os.path.join(home, rest) for home in self.home_candidates(rest, var)]
         elif rest is None and "${" not in text:
             candidates = [text if os.path.isabs(text) else os.path.join(here, text),
                           os.path.join(self.root, text.lstrip("/\\"))]
@@ -1104,15 +1152,15 @@ class Scanner:
         self.warn(f"{self.rel(current_file)}: không tìm thấy file {raw} (có thể nằm ngoài thư mục quét)")
         return None
 
-    def home_candidates(self, rest):
+    def home_candidates(self, rest, var="PROJECT_HOME"):
         if self.project_home:
             return [self.project_home]
-        if self.detected_home:
-            return [self.detected_home]
+        if var in self.detected_homes:
+            return [self.detected_homes[var]]
         folder = self.root
         while True:
             if os.path.isfile(os.path.join(folder, rest)):
-                self.detected_home = folder
+                self.detected_homes[var] = folder
                 return [folder]
             parent = os.path.dirname(folder)
             if parent == folder:
@@ -1175,7 +1223,9 @@ class Scanner:
 
     def scan(self):
         self.index_files()
-        workflows = sorted(p for paths in self.by_name.values() for p in paths if p.lower().endswith(WORKFLOW_EXT))
+        workflows = sorted(
+            p for paths in self.by_name.values() for p in paths if p.lower().endswith(self.fmt["wf"])
+        )
         for k, path in enumerate(workflows):
             self.progress(phase="scan", roots_done=k, roots_total=len(workflows))
             self.walk_workflow(path, [], set())
@@ -1195,7 +1245,7 @@ class Scanner:
         name = os.path.basename(path)
         actions = {}
         start = None
-        for action in root.iter("action"):
+        for action in root.iter(self.fmt["action"]):
             act_name = _text(action, "name")
             if not act_name:
                 continue
@@ -1232,20 +1282,26 @@ class Scanner:
         act_type = _text(action, "type")
         upper = act_type.upper()
         sql = _text(action, "sql")
-        if _text(action, "sqlfromfile").upper() == "Y":
+        if _text(action, "sqlfromfile").upper() in ("Y", "T", "TRUE"):
             target = self.resolve_file(_text(action, "sqlfilename"), path)
             if target:
                 sql = _read_text(target, self)
         if sql:
             self.add_sql(sql, path, chain, act_name, act_type)
         filename = _text(action, "filename")
+        if not filename and upper in self.fmt["pl_types"] + self.fmt["wf_types"]:
+            # Pentaho luu trong repository: chi co ten + thu muc, tim theo duoi duong dan.
+            name = _text(action, "transname") or _text(action, "jobname")
+            if name:
+                ext = self.fmt["pl"] if upper in self.fmt["pl_types"] else self.fmt["wf"]
+                filename = f"{_text(action, 'directory').rstrip('/')}/{name}{'' if name.lower().endswith(ext) else ext}"
         if filename:
             target = self.resolve_file(filename, path)
             if target is None:
                 return
-            if target.lower().endswith(PIPELINE_EXT) or upper == "PIPELINE":
+            if target.lower().endswith(self.fmt["pl"]) or upper in self.fmt["pl_types"]:
                 self.walk_pipeline(target, chain, stack)
-            elif target.lower().endswith(WORKFLOW_EXT) or upper == "WORKFLOW":
+            elif target.lower().endswith(self.fmt["wf"]) or upper in self.fmt["wf_types"]:
                 self.walk_workflow(target, chain, stack)
 
     # ----- pipeline
@@ -1259,7 +1315,7 @@ class Scanner:
         self.files_seen.add(path)
         name = os.path.basename(path)
         transforms = {}
-        for t in root.iter("transform"):
+        for t in root.iter(self.fmt["step"]):
             t_name = _text(t, "name")
             if t_name:
                 transforms[t_name] = t
@@ -1290,12 +1346,11 @@ class Scanner:
                 table = _qualified(_first_text(t, "schema"), _first_text(t, "table"))
                 if table:
                     reads[t_name] = ([table], [])
-            elif t_type in ("PipelineExecutor", "WorkflowExecutor", "SimpleMapping", "Mapping",
-                            "MetaInject", "SingleThreader"):
+            elif t_type in EXECUTOR_TYPES:
                 target = self.resolve_file(_first_text(t, "filename"), path)
-                if target and target.lower().endswith(PIPELINE_EXT):
+                if target and target.lower().endswith(self.fmt["pl"]):
                     self.walk_pipeline(target, step_chain, stack)
-                elif target and target.lower().endswith(WORKFLOW_EXT):
+                elif target and target.lower().endswith(self.fmt["wf"]):
                     self.walk_workflow(target, step_chain, stack | {path})
 
         for t_name, t in transforms.items():
@@ -1420,7 +1475,7 @@ def _raw_text(sql, toks):
 WRITE_KINDS = ("INSERT", "MERGE", "UPDATE")
 
 
-def scan_folder(folder, project_home=None, progress=None, label=None):
+def scan_folder(folder, project_home=None, progress=None, label=None, fmt="hop"):
     """Quet thu muc, tra ve dict san sang luu DB: statements, edges, columns, warnings.
 
     Chi lay workflow goc nam trong thu muc nay (ke ca thu muc con); file chung goi toi o ngoai
@@ -1430,18 +1485,22 @@ def scan_folder(folder, project_home=None, progress=None, label=None):
         raise ValueError(f"Không tìm thấy thư mục: {folder}")
     if project_home and not os.path.isdir(project_home):
         raise ValueError(f"Không tìm thấy thư mục PROJECT_HOME: {project_home}")
-    scanner = Scanner(folder, project_home, progress)
+    scanner = Scanner(folder, project_home, progress, fmt)
     scanner.scan()
-    if not any(p.lower().endswith(WORKFLOW_EXT) for paths in scanner.by_name.values() for p in paths):
-        raise ValueError(f"Thư mục {label or folder} không có file .hwf nào.")
-    result = build(scanner)
+    ext = scanner.fmt["wf"]
+    if not any(p.lower().endswith(ext) for paths in scanner.by_name.values() for p in paths):
+        raise ValueError(f"Thư mục {label or folder} không có file {ext} nào ({scanner.fmt['label']}).")
+    result = build(scanner, scanner.fmt["id_base"])
     if label:
         result["folder"] = label
-    result["project_home"] = scanner.project_home or scanner.detected_home or ""
+    if scanner.project_home:
+        result["project_home"] = scanner.project_home
+    else:
+        result["project_home"] = " · ".join(f"${{{v}}} = {h}" for v, h in scanner.detected_homes.items())
     return result
 
 
-def build(scanner):
+def build(scanner, id_base=0):
     # Temp view chi co nghia trong file tao ra no: doi ten thanh nut temp:<file>:<ten>.
     temps = {}
     for st in scanner.statements:
@@ -1453,10 +1512,19 @@ def build(scanner):
             return f"{TEMP_PREFIX}{file}:{name}"
         return name
 
+    # Cot cua bang theo thu tu, lay tu CREATE TABLE trong job (cau sau cung thang).
+    schemas = {}
+    for st in scanner.statements:
+        if st["info"].get("schema"):
+            for t in st["info"]["targets"]:
+                schemas[node(t, st["file"])] = st["info"]["schema"]
+
     statements, edges, columns = [], set(), set()
     location_tables = {}
-    for sid, st in enumerate(scanner.statements, 1):
+    for sid, st in enumerate(scanner.statements, id_base + 1):
         info, file = st["info"], st["file"]
+        if info.get("positional") and len(info["targets"]) == 1 and node(info["targets"][0], file) in schemas:
+            info = _apply_positional(info, schemas[node(info["targets"][0], file)])
         targets = [node(n, file) for n in info["targets"]]
         sources = [node(n, file) for n in info["sources"]]
         statements.append(
@@ -1492,7 +1560,7 @@ def build(scanner):
             else:
                 edges.add((loc, table, sid))
                 columns.add((table, "*", loc, "*", sid, ""))
-                statements[sid - 1]["sources"] = _unique(statements[sid - 1]["sources"] + [loc])
+                statements[sid - id_base - 1]["sources"] = _unique(statements[sid - id_base - 1]["sources"] + [loc])
 
     return {
         "folder": scanner.root,
@@ -1503,6 +1571,29 @@ def build(scanner):
         "edges": sorted(edges),
         "columns": sorted(columns),
     }
+
+
+def _apply_positional(info, schema):
+    """INSERT khong ghi cot: cot thu k cua SELECT do vao cot thu k cua bang dich (theo CREATE TABLE)."""
+    target = info["targets"][0]
+    info = dict(info)
+    columns = [c for c in info["columns"] if c[0] != target]
+    exprs = {k: v for k, v in info["exprs"].items() if k[0] != target}
+    for k, item in enumerate(info["positional"]):
+        tcol = schema[k] if k < len(schema) else item["alias"]
+        if item["star"] is not None:
+            for table in item["star"]:
+                columns.append((target, "*", table, "*"))
+            continue
+        if not tcol:
+            continue
+        for table, col in item["refs"]:
+            columns.append((target, tcol, table, col))
+        if item["expr"]:
+            exprs[(target, tcol)] = item["expr"]
+    info["columns"] = _unique(columns)
+    info["exprs"] = exprs
+    return info
 
 
 def node_kind(name):

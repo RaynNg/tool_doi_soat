@@ -231,6 +231,43 @@ def _split_columns(value):
 def _check_fragment(text, name):
     if FORBIDDEN_RE.search(text):
         raise ValueError(f"{name} không được chứa ; hoặc chú thích SQL: {text}")
+    word = write_keyword(text)
+    if word:
+        raise ValueError(f"{name} có từ khóa {word}: tool chỉ đọc dữ liệu, không được ghi/sửa/xóa. {text}")
+
+
+# Tu khoa lam thay doi du lieu / cau truc. Chi xet tu dung rieng ngoai chuoi '...', ngoai `ten` va chu thich,
+# nen cot update_time hay ham replace(...) khong bi chan nham.
+WRITE_KEYWORDS = {
+    "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "DROP", "TRUNCATE", "ALTER", "CREATE", "RENAME",
+    "GRANT", "REVOKE", "LOAD", "OVERWRITE", "MSCK", "VACUUM", "OPTIMIZE", "RESTORE", "EXCHANGE", "CALL",
+    "REFRESH", "CACHE", "UNCACHE", "ANALYZE", "COPY", "IMPORT", "EXPORT", "LOCK", "UNLOCK", "COMPUTE",
+}
+_STRIP_RE = re.compile(r"""'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`[^`]*`|--[^\n]*|/\*.*?\*/""", re.S)
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def write_keyword(sql):
+    """Tu khoa ghi/sua/xoa dau tien trong cau (ngoai chuoi, `ten`, chu thich); None neu chi doc."""
+    bare = _STRIP_RE.sub(" ", sql or "")
+    # Bo phan ten sau dau cham (t.delete, db.update...) vi do la ten cot/bang, khong phai lenh.
+    bare = re.sub(r"\.\s*[A-Za-z_][A-Za-z0-9_]*", " ", bare)
+    for word in _WORD_RE.findall(bare):
+        if word.upper() in WRITE_KEYWORDS:
+            return word.upper()
+    return None
+
+
+def ensure_read_only(sql):
+    """Kiem tra lan cuoi truoc khi gui len Thrift: chi mot cau SELECT/WITH, khong co lenh ghi/sua/xoa."""
+    text = (sql or "").strip().rstrip(";").strip()
+    if ";" in _STRIP_RE.sub(" ", text):
+        raise ValueError("Từ chối chạy: query có nhiều câu (dấu ;).")
+    if not SELECT_RE.match(_STRIP_RE.sub(" ", text).strip()):
+        raise ValueError("Từ chối chạy: query không bắt đầu bằng SELECT hoặc WITH.")
+    word = write_keyword(text)
+    if word:
+        raise ValueError(f"Từ chối chạy: query có lệnh {word} (ghi/sửa/xóa dữ liệu). Tool chỉ được đọc dữ liệu.")
 
 
 def _custom_sql(text, date, name, now):
@@ -240,6 +277,12 @@ def _custom_sql(text, date, name, now):
         raise ValueError(f"Query {name} chỉ được có một câu, không chứa dấu ; ở giữa.")
     if not SELECT_RE.match(sql):
         raise ValueError(f"Query {name} phải bắt đầu bằng SELECT hoặc WITH.")
+    word = write_keyword(sql)
+    if word:
+        raise ValueError(
+            f"Query {name} có lệnh {word}: tool chỉ được đọc dữ liệu (SELECT), không được ghi/sửa/xóa. "
+            "Nếu đây là tên cột thì đặt trong dấu `...`."
+        )
     return _fill_date(sql, date, f"Query {name}", now)
 
 
