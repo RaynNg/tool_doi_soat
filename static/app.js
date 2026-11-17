@@ -1059,16 +1059,17 @@ function openEditor(index) {
   checkEditorTables();
 }
 
-const VIEWS = { "#ket-noi": "conn", "#lich-su": "hist", "#phu-thuoc": "dep" };
+const VIEWS = { "#ket-noi": "conn", "#lich-su": "hist", "#phu-thuoc": "dep", "#query": "query" };
 
 function showView() {
   const view = VIEWS[location.hash] || "main";
-  ["main", "conn", "hist", "dep"].forEach((name) => {
+  ["main", "conn", "hist", "dep", "query"].forEach((name) => {
     $(`view-${name}`).hidden = name !== view;
     $(`nav-${name}`).classList.toggle("active", name === view);
   });
   if (view === "hist") loadHistory();
   if (view === "dep") loadLineage();
+  if (view === "query") renderQuery();
 }
 
 // ---------- Lich su (doc tu SQLite) ----------
@@ -1627,7 +1628,7 @@ function switchSystem(system, reload = true) {
 
 function renderSystemTexts() {
   const sys = SYSTEMS[dep.system];
-  document.querySelectorAll(".sys-switch [data-system]").forEach((b) => {
+  document.querySelectorAll("#view-dep .sys-switch [data-system]").forEach((b) => {
     const on = b.dataset.system === dep.system;
     b.classList.toggle("active", on);
     b.setAttribute("aria-selected", on);
@@ -2248,7 +2249,7 @@ $("dep-home-clear").addEventListener("click", () => {
   renderPickers();
 });
 $("dep-scan").addEventListener("click", scanLineage);
-document.querySelector(".sys-switch").addEventListener("click", (event) => {
+document.querySelector("#view-dep .sys-switch").addEventListener("click", (event) => {
   const button = event.target.closest("[data-system]");
   if (button && !scanning) switchSystem(button.dataset.system);
 });
@@ -2592,6 +2593,255 @@ $("threshold").addEventListener("input", () => {
   saveSoon();
   render();
 });
+// ---------- Query (chi SELECT/WITH/SHOW/DESC, chay tren tung he thong) ----------
+
+const QUERY_PREFS = "doi_soat_query";
+const QUERY_MAX_ROWS = 10000;
+// Moi he thong giu ket qua rieng: chuyen qua lai de so sanh cung mot cau query.
+const q = { side: "new", sql: "", limit: 1000, results: { old: null, new: null }, timers: {} };
+const NUMERIC_TYPES = new Set(["tinyint", "smallint", "int", "bigint", "float", "double", "decimal"]);
+
+(function readQueryPrefs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(QUERY_PREFS) || "{}");
+    if (saved.side in SIDES) q.side = saved.side;
+    if (typeof saved.sql === "string") q.sql = saved.sql;
+    if (Number(saved.limit) > 0) q.limit = Math.min(Number(saved.limit), QUERY_MAX_ROWS);
+  } catch (err) {
+    // Khong doc duoc thi dung mac dinh.
+  }
+})();
+
+function writeQueryPrefs() {
+  try {
+    localStorage.setItem(QUERY_PREFS, JSON.stringify({ side: q.side, sql: q.sql, limit: q.limit }));
+  } catch (err) {
+    // Trinh duyet chan luu: bo qua.
+  }
+}
+
+const otherSide = (side) => (side === "old" ? "new" : "old");
+
+function formatSeconds(sec) {
+  if (sec === null || sec === undefined) return "—";
+  return sec < 60
+    ? `${Number(sec).toFixed(1)} giây`
+    : `${Math.floor(sec / 60)} phút ${Math.round(sec % 60)} giây`;
+}
+
+function renderQuery() {
+  const side = q.side;
+  const name = SIDES[side];
+  const res = q.results[side];
+  const running = Boolean(res && res.state === "running");
+  document.querySelectorAll("#q-switch [data-qside]").forEach((b) => {
+    const on = b.dataset.qside === side;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on);
+    const r = q.results[b.dataset.qside];
+    b.textContent = SIDES[b.dataset.qside] + (r && r.state === "running" ? " · đang chạy" : "");
+  });
+  if ($("q-sql").value !== q.sql) $("q-sql").value = q.sql;
+  $("q-limit").value = q.limit;
+  $("q-title").textContent = `Câu query chạy trên ${name}`;
+  $("q-run").textContent = `Chạy trên ${name}`;
+  $("q-run").disabled = running;
+  $("q-stop").hidden = !running;
+  $("q-other").textContent = `Chuyển sang ${SIDES[otherSide(side)]}`;
+  $("q-result-title").textContent = `Kết quả ${name}`;
+
+  const host = $(`${side}_host`).value.trim();
+  $("kpi-q-side").textContent = name;
+  $("kpi-q-host").textContent = host
+    ? `${host}:${$(`${side}_port`).value} · ${$(`${side}_username`).value.trim() || "chưa có user"}`
+    : "Chưa cấu hình kết nối";
+
+  const states = { running: "Đang chạy", done: "Xong", error: "Lỗi", cancelled: "Đã dừng" };
+  $("kpi-q-state").textContent = res ? states[res.state] || res.state : "—";
+  $("kpi-q-state-note").textContent = res ? res.sql.replace(/\s+/g, " ").slice(0, 60) : "Chưa chạy";
+  const done = Boolean(res && res.state === "done");
+  $("kpi-q-rows").textContent = done ? res.rows.length.toLocaleString("en-US") : "—";
+  $("kpi-q-rows-note").textContent = done
+    ? res.truncated
+      ? `Chỉ lấy ${res.limit.toLocaleString("en-US")} dòng đầu`
+      : `${res.columns.length} cột`
+    : "";
+  $("kpi-q-time").textContent = res ? formatSeconds(res.seconds ?? res.elapsed) : "—";
+  $("kpi-q-time-note").textContent = res ? `Chạy lúc ${res.at}` : "";
+
+  const status = $("q-status");
+  status.classList.toggle("bad", Boolean(res && res.state === "error"));
+  if (!res) status.textContent = `Chưa chạy query nào trên ${name}.`;
+  else if (running) status.textContent = `Đang chạy trên ${name}… ${formatSeconds(res.elapsed)}`;
+  else if (res.state === "error") status.textContent = res.error;
+  else if (res.state === "cancelled") status.textContent = res.error || "Đã dừng query.";
+  else if (!res.columns.length) status.textContent = "Câu lệnh chạy xong, không trả về cột nào.";
+  else
+    status.textContent = `${res.rows.length.toLocaleString("en-US")} dòng · ${res.columns.length} cột · ${formatSeconds(res.seconds)}${
+      res.truncated ? ' · còn dữ liệu phía sau, tăng "Tối đa" hoặc thêm LIMIT/WHERE để xem' : ""
+    }`;
+
+  const showTable = done && res.columns.length > 0;
+  $("q-scroll").hidden = !showTable;
+  $("q-copy").hidden = !showTable || !res.rows.length;
+  if (!showTable) {
+    $("q-head").innerHTML = "";
+    $("q-body").innerHTML = "";
+    delete $("q-body").dataset.id;
+    return;
+  }
+  // Bang ket qua co the lon: chi ve lai khi doi sang ket qua khac.
+  if ($("q-body").dataset.id === res.id) return;
+  $("q-body").dataset.id = res.id;
+  const numeric = res.columns.map((c) => NUMERIC_TYPES.has(c.type));
+  $("q-head").innerHTML = `<tr><th class="idx">#</th>${res.columns
+    .map(
+      (c, i) =>
+        `<th${numeric[i] ? ' class="num"' : ""}>${esc(c.name)}${c.type ? `<small>${esc(c.type)}</small>` : ""}</th>`,
+    )
+    .join("")}</tr>`;
+  $("q-body").innerHTML = res.rows.length
+    ? res.rows
+        .map(
+          (row, r) =>
+            `<tr><td class="idx num">${r + 1}</td>${row
+              .map((v, i) =>
+                v === null
+                  ? `<td${numeric[i] ? ' class="num"' : ""}><span class="dash">NULL</span></td>`
+                  : `<td${numeric[i] ? ' class="num"' : ""} title="${esc(v)}">${esc(numeric[i] ? groupDigits(v) : v)}</td>`,
+              )
+              .join("")}</tr>`,
+        )
+        .join("")
+    : `<tr><td class="idx"></td><td colspan="${res.columns.length}" class="muted">Không có dòng nào.</td></tr>`;
+}
+
+function switchQuerySide(side) {
+  if (!(side in SIDES) || side === q.side) return;
+  q.side = side;
+  $("q-error").textContent = "";
+  writeQueryPrefs();
+  renderQuery();
+}
+
+async function runQuery() {
+  const side = q.side;
+  const name = SIDES[side];
+  $("q-error").textContent = "";
+  if (!q.sql.trim()) {
+    $("q-error").textContent = "Chưa nhập câu query.";
+    $("q-sql").focus();
+    return;
+  }
+  if (!$(`${side}_host`).value.trim() || !$(`${side}_username`).value.trim()) {
+    $("q-error").innerHTML = `Chưa nhập host hoặc user của Thrift ${name}. <a class="link" href="#ket-noi">Mở trang Kết nối</a>`;
+    return;
+  }
+  if (!$(`${side}_password`).value) {
+    $("q-error").innerHTML = `Chưa có mật khẩu Thrift ${name}. <a class="link" href="#ket-noi">Nhập ở trang Kết nối</a>`;
+    return;
+  }
+  const sql = q.sql;
+  $("q-run").disabled = true;
+  try {
+    const body = await postJson("/api/query", {
+      side,
+      connection: connection(side),
+      sql,
+      limit: q.limit,
+    });
+    q.results[side] = {
+      id: body.id,
+      state: "running",
+      sql,
+      elapsed: 0,
+      at: new Date().toLocaleTimeString("vi-VN"),
+    };
+  } catch (err) {
+    $("q-error").textContent = err.message;
+    renderQuery();
+    return;
+  }
+  renderQuery();
+  pollQuery(side, q.results[side].id);
+}
+
+async function pollQuery(side, id) {
+  clearTimeout(q.timers[side]);
+  const current = q.results[side];
+  if (!current || current.id !== id) return;
+  try {
+    Object.assign(current, await api(`/api/query/${id}`));
+  } catch (err) {
+    Object.assign(current, { state: "error", error: `Mất kết nối với công cụ: ${err.message}` });
+  }
+  if (q.results[side] !== current) return;
+  if (location.hash === "#query") renderQuery();
+  if (current.state === "running") q.timers[side] = setTimeout(() => pollQuery(side, id), POLL_MS);
+}
+
+async function stopQuery() {
+  const res = q.results[q.side];
+  if (!res || res.state !== "running") return;
+  $("q-stop").disabled = true;
+  try {
+    await postJson(`/api/query/${res.id}/cancel`, {});
+  } catch (err) {
+    $("q-error").textContent = err.message;
+  } finally {
+    $("q-stop").disabled = false;
+  }
+}
+
+function copyQueryResult() {
+  const res = q.results[q.side];
+  if (!res || !res.columns) return;
+  const clean = (v) => (v === null ? "" : String(v).replace(/[\t\r\n]+/g, " "));
+  const text = [res.columns.map((c) => clean(c.name)), ...res.rows.map((r) => r.map(clean))]
+    .map((r) => r.join("\t"))
+    .join("\r\n");
+  const done = () => {
+    $("q-copy").textContent = "Đã chép";
+    setTimeout(() => ($("q-copy").textContent = "Chép kết quả"), 1500);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, () => {});
+    return;
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+  done();
+}
+
+$("q-switch").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-qside]");
+  if (button) switchQuerySide(button.dataset.qside);
+});
+$("q-other").addEventListener("click", () => switchQuerySide(otherSide(q.side)));
+$("q-run").addEventListener("click", runQuery);
+$("q-stop").addEventListener("click", stopQuery);
+$("q-copy").addEventListener("click", copyQueryResult);
+$("q-sql").addEventListener("input", () => {
+  q.sql = $("q-sql").value;
+  writeQueryPrefs();
+});
+$("q-sql").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    if (!$("q-run").disabled) runQuery();
+  }
+});
+$("q-limit").addEventListener("change", () => {
+  const n = Math.round(Number($("q-limit").value));
+  q.limit = n >= 1 ? Math.min(n, QUERY_MAX_ROWS) : 1000;
+  $("q-limit").value = q.limit;
+  writeQueryPrefs();
+});
+
 addEventListener("hashchange", showView);
 
 $("date").value = today();
@@ -2599,6 +2849,7 @@ showView();
 render();
 restore().then(() => {
   updateScope();
+  renderQuery();
   render();
   schedulePreview();
 });

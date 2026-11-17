@@ -270,6 +270,26 @@ def ensure_read_only(sql):
         raise ValueError(f"Từ chối chạy: query có lệnh {word} (ghi/sửa/xóa dữ liệu). Tool chỉ được đọc dữ liệu.")
 
 
+BROWSE_RE = re.compile(r"^\s*(show|desc|describe)\b", re.IGNORECASE)
+
+
+def ensure_browse_only(sql):
+    """Trang Query: cho SELECT/WITH (chi doc) va SHOW, DESC/DESCRIBE; tra ve cau da bo dau ; cuoi."""
+    text = (sql or "").strip().rstrip(";").strip()
+    if not text:
+        raise ValueError("Chưa nhập câu query.")
+    bare = _STRIP_RE.sub(" ", text)
+    if ";" in bare:
+        raise ValueError("Từ chối chạy: chỉ chạy một câu mỗi lần (có dấu ; ở giữa).")
+    # SHOW/DESC chi xem thong tin, khong ghi duoc (SHOW CREATE TABLE co chu CREATE nhung khong tao gi).
+    if BROWSE_RE.match(bare.strip()):
+        return text
+    if not SELECT_RE.match(bare.strip()):
+        raise ValueError("Từ chối chạy: chỉ được dùng SELECT, WITH, SHOW hoặc DESC/DESCRIBE.")
+    ensure_read_only(text)
+    return text
+
+
 def _custom_sql(text, date, name, now):
     """Cau query tu viet: chi mot cau SELECT, tra ve COUNT roi den cac SUM theo dung thu tu cot tien."""
     sql = text.strip().rstrip(";").strip()

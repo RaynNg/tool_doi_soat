@@ -683,3 +683,20 @@ kbd { padding: 1px 7px; font: 600 11px/16px var(--font); color: var(--beige-ink)
 .hint-warn { color: #6b4600; background: #fff1cc; }
 .hint-ok { color: #04542a; background: #dcf8e7; }
 .hint-muted { color: var(--muted); background: var(--raised); }
+
+/* ---------- Trang Query ---------- */
+.q-hint { margin-left: auto; }
+.q-hint kbd { margin: 0 2px; }
+#q-sql { min-height: 160px; margin: 0; }
+.q-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.q-limit { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; font-size: 13px; }
+.q-limit input { width: 96px; height: 36px; margin: 0; }
+.q-scroll { max-height: 62vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-control); }
+.q-table thead th { height: auto; padding: 7px 14px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
+.q-table thead th small { display: block; font-weight: 400; font-size: 11px; line-height: 14px; color: var(--muted); }
+.q-table td { height: 34px; padding: 4px 14px; font: 12.5px/18px var(--code); max-width: 480px; overflow: hidden; text-overflow: ellipsis; }
+.q-table th.num, .q-table td.num { text-align: right; }
+.q-table th.idx, .q-table td.idx { position: sticky; left: 0; color: var(--muted); background: var(--surface); text-align: right; }
+.q-table thead th.idx { z-index: 2; }
+.q-table tbody tr:hover td { background: var(--raised); }
+#q-status.bad { color: var(--brand-dark); }

@@ -8,9 +8,11 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -168,12 +170,62 @@ def connect(cfg, cancel):
                 raise QueryCancelled() from None
 
 
+# Session dang mo tren Thrift: tat tool thi bao tat ca dung lai va cho dong session tu te.
+sessions_cond = threading.Condition()
+live_cancels = []
+SHUTDOWN_WAIT_SECONDS = 4
+
+
+def close_session(conn):
+    """Gui CloseSession roi LUON dong socket, ke ca khi CloseSession loi (mang chap chon, timeout).
+    Spark Thrift (che do binary) tu dong session khi socket bi ngat, nen dong socket la chot chan cuoi."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn._transport.close()
+        except Exception:
+            pass
+
+
+@contextmanager
+def thrift_session(cfg, cancel):
+    """Mo mot session cho mot lan chay, ra khoi khoi with (xong, loi, bi dung) la dong ngay."""
+    with sessions_cond:
+        live_cancels.append(cancel)
+    try:
+        conn = connect(cfg, cancel)
+        try:
+            yield conn
+        finally:
+            close_session(conn)
+    finally:
+        with sessions_cond:
+            live_cancels.remove(cancel)
+            sessions_cond.notify_all()
+
+
+def stop_all_sessions(wait_seconds=SHUTDOWN_WAIT_SECONDS):
+    """Tat tool: dung moi query, cho cac luong dong session (vong poll phan ung trong ~1 giay)."""
+    with jobs_lock:
+        for job in jobs.values():
+            job.cancel.set()
+    with query_lock:
+        for job in query_jobs.values():
+            job.cancel.set()
+    with sessions_cond:
+        for cancel in live_cancels:
+            cancel.set()
+        return sessions_cond.wait_for(lambda: not live_cancels, wait_seconds)
+
+
 def run_query(cfg, sql, cancel):
     # Chot chan cuoi: chi gui cau SELECT len Thrift, khong bao gio chay lenh ghi/sua/xoa.
     reconcile.ensure_read_only(sql)
     # Chi thu lai buoc ket noi; query da gui len server thi khong chay lai de tranh tai gap doi.
-    conn = connect(cfg, cancel)
-    try:
+    with thrift_session(cfg, cancel) as conn:
         cursor = conn.cursor()
         cursor.execute(sql, async_=True)
         while True:
@@ -185,8 +237,6 @@ def run_query(cfg, sql, cancel):
             if cancel.wait(POLL_SECONDS):
                 cursor.cancel()
                 raise QueryCancelled()
-    finally:
-        conn.close()
 
 
 def error_text(exc):
@@ -1145,6 +1195,143 @@ def job_cancel(job_id):
     return jsonify(ok=True)
 
 
+# ---------- Trang Query: chay tay mot cau SELECT/SHOW/DESC tren mot he thong ----------
+
+QUERY_ROW_LIMIT = 1000
+QUERY_MAX_ROWS = 10000
+QUERY_KEEP = 8
+# Trinh duyet hoi trang thai moi giay; tab an bi Chrome giam con ~1 lan/phut. Qua lau khong hoi
+# nghia la da dong trang: huy query de khong giu session tren server.
+QUERY_ABANDON_SECONDS = 150
+query_jobs = {}
+query_lock = threading.Lock()
+MAX_SAFE_INT = 2 ** 53
+
+
+def cell_text(value):
+    """Gia tri tra ve tu Thrift -> chuoi de hien thi (giu nguyen do chinh xac cua so lon/Decimal)."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return "0x" + value.hex()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    return str(value)
+
+
+class QueryJob:
+    def __init__(self, side, cfg, sql, limit):
+        self.id = uuid.uuid4().hex
+        self.side = side
+        self.cfg = cfg
+        self.sql = sql
+        self.limit = limit
+        self.cancel = threading.Event()
+        self.state = "running"
+        self.error = ""
+        self.columns = []
+        self.rows = []
+        self.truncated = False
+        self.started = datetime.now()
+        self.seconds = None
+        self.seen = time.monotonic()
+
+    def run(self):
+        try:
+            with thrift_session(self.cfg, self.cancel) as conn:
+                cursor = conn.cursor()
+                cursor.execute(self.sql, async_=True)
+                while True:
+                    status = cursor.poll()
+                    if status.operationState == TOperationState.FINISHED_STATE:
+                        break
+                    if status.operationState not in RUNNING_STATES:
+                        raise QueryFailed(status.errorMessage or "Query không chạy thành công.")
+                    if time.monotonic() - self.seen > QUERY_ABANDON_SECONDS:
+                        self.error = "Trang Query đã đóng nên tool tự dừng query."
+                        self.cancel.set()
+                    if self.cancel.wait(POLL_SECONDS):
+                        cursor.cancel()
+                        raise QueryCancelled()
+                columns = [
+                    {"name": d[0], "type": str(d[1] or "").replace("_TYPE", "").lower()}
+                    for d in (cursor.description or [])
+                ]
+                # Lay them 1 dong de biet con du lieu phia sau hay khong.
+                fetched = cursor.fetchmany(self.limit + 1)
+                self.truncated = len(fetched) > self.limit
+                self.columns = columns
+                self.rows = [[cell_text(v) for v in row] for row in fetched[: self.limit]]
+                self.state = "done"
+        except QueryCancelled:
+            self.state = "cancelled"
+        except Exception as exc:
+            self.error = error_text(exc)
+            self.state = "error"
+        self.seconds = round((datetime.now() - self.started).total_seconds(), 2)
+
+    def snapshot(self):
+        return {
+            "id": self.id, "side": self.side, "state": self.state, "error": self.error,
+            "columns": self.columns, "rows": self.rows, "truncated": self.truncated,
+            "limit": self.limit, "seconds": self.seconds,
+            "elapsed": round((datetime.now() - self.started).total_seconds(), 1),
+        }
+
+
+@app.post("/api/query")
+def query_start():
+    data = request.get_json() or {}
+    side = data.get("side")
+    if side not in SIDES:
+        raise ValueError("Chưa chọn hệ thống để chạy query.")
+    cfg = read_connection(data.get("connection"), side)
+    sql = reconcile.ensure_browse_only(str(data.get("sql") or ""))
+    try:
+        limit = int(data.get("limit") or QUERY_ROW_LIMIT)
+    except (TypeError, ValueError):
+        raise ValueError("Số dòng tối đa không hợp lệ.") from None
+    if not 1 <= limit <= QUERY_MAX_ROWS:
+        raise ValueError(f"Số dòng tối đa phải từ 1 đến {QUERY_MAX_ROWS}.")
+    job = QueryJob(side, cfg, sql, limit)
+    with query_lock:
+        if any(j.state == "running" and j.side == side for j in query_jobs.values()):
+            return jsonify(error=f"Đang có query chạy trên {SIDES[side]}, dừng nó trước."), 409
+        # Chi giu vai ket qua gan nhat de khong phinh bo nho.
+        for old_id in [k for k, j in query_jobs.items() if j.state != "running"][: max(0, len(query_jobs) - QUERY_KEEP)]:
+            del query_jobs[old_id]
+        query_jobs[job.id] = job
+    threading.Thread(target=job.run, daemon=True).start()
+    return jsonify(id=job.id)
+
+
+@app.get("/api/query/<job_id>")
+def query_status(job_id):
+    with query_lock:
+        job = query_jobs.get(job_id)
+    if job is None:
+        return jsonify(error="Không tìm thấy query."), 404
+    job.seen = time.monotonic()
+    return jsonify(job.snapshot())
+
+
+@app.post("/api/query/<job_id>/cancel")
+def query_cancel(job_id):
+    with query_lock:
+        job = query_jobs.get(job_id)
+    if job is None:
+        return jsonify(error="Không tìm thấy query."), 404
+    job.cancel.set()
+    return jsonify(ok=True)
+
+
 def find_free_port():
     # VDI co the dung chung may, nen khong gia dinh cong dau tien con trong.
     for port in range(FIRST_PORT, FIRST_PORT + PORT_ATTEMPTS):
@@ -1157,8 +1344,29 @@ def find_free_port():
     raise SystemExit("Khong tim duoc cong trong de chay giao dien.")
 
 
+def watch_console_close():
+    """Windows: dong cua so console / Ctrl+C / log off thi dong het session truoc khi process bi giet
+    (Windows cho khoang 5 giay). Bi kill cung thi OS van dong socket va server tu don session."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(event):
+        try:
+            stop_all_sessions()
+        except Exception:
+            pass
+        return False  # de Windows/Python xu ly tiep (thoat tool)
+
+    watch_console_close.handler = handler  # giu tham chieu, khong de bi thu gom
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
+
+
 def main():
     port = find_free_port()
+    watch_console_close()
     # Mo DB som: chuyen CSV cu va danh dau cac luot bi tat giua chung truoc khi giao dien goi vao.
     try:
         get_store()
